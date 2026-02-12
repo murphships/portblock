@@ -6,6 +6,8 @@ you give it an OpenAPI spec. it gives you a working API server with realistic da
 
 think prism, but your mock actually remembers things.
 
+![portblock demo](demo.gif)
+
 ## install
 
 ### homebrew (macOS/linux)
