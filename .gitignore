@@ -1,0 +1,5 @@
+.env
+portblock
+*.exe
+dist/
+*.log
