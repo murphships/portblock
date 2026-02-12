@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -18,6 +23,9 @@ import (
 
 	"github.com/brianvoe/gofakeit/v7"
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	"github.com/getkin/kin-openapi/routers"
+	"github.com/getkin/kin-openapi/routers/gorillamux"
 	"github.com/spf13/cobra"
 )
 
@@ -26,7 +34,8 @@ var (
 	seed    int64
 	delay   time.Duration
 	chaos   bool
-	version = "0.1.0"
+	noAuth  bool
+	version = "0.2.0"
 )
 
 func main() {
@@ -47,8 +56,30 @@ func main() {
 	serveCmd.Flags().Int64Var(&seed, "seed", 0, "random seed for reproducible data (0 = random)")
 	serveCmd.Flags().DurationVar(&delay, "delay", 0, "simulated latency per request (e.g. 200ms)")
 	serveCmd.Flags().BoolVar(&chaos, "chaos", false, "chaos mode — random 500s and latency spikes")
+	serveCmd.Flags().BoolVar(&noAuth, "no-auth", false, "skip auth simulation")
 
-	rootCmd.AddCommand(serveCmd)
+	proxyCmd := &cobra.Command{
+		Use:   "proxy [spec-file]",
+		Short: "proxy to a real API and validate against the spec",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runProxy,
+	}
+	var proxyTarget string
+	var proxyRecord string
+	proxyCmd.Flags().IntVarP(&port, "port", "p", 4000, "port to listen on")
+	proxyCmd.Flags().StringVar(&proxyTarget, "target", "", "target base URL to proxy to (required)")
+	proxyCmd.Flags().StringVar(&proxyRecord, "record", "", "file to record responses to")
+	proxyCmd.MarkFlagRequired("target")
+
+	replayCmd := &cobra.Command{
+		Use:   "replay [recordings-file]",
+		Short: "replay recorded responses",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runReplay,
+	}
+	replayCmd.Flags().IntVarP(&port, "port", "p", 4000, "port to listen on")
+
+	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -72,10 +103,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 		seed = time.Now().UnixNano()
 	}
 
+	router, err := gorillamux.NewRouter(doc)
+	if err != nil {
+		log.Printf("warning: could not build validation router: %v", err)
+	}
+
 	server := &MockServer{
-		doc:   doc,
-		store: NewStore(),
-		seed:  seed,
+		doc:    doc,
+		store:  NewStore(),
+		seed:   seed,
+		router: router,
+		noAuth: noAuth,
 	}
 
 	mux := http.NewServeMux()
@@ -94,9 +132,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if chaos {
 		fmt.Printf("  chaos: enabled 💥\n")
 	}
+	if noAuth {
+		fmt.Printf("  auth:  disabled\n")
+	}
 	fmt.Printf("\n  ready at http://localhost:%d\n\n", port)
 
-	// print registered routes
 	for path, pathItem := range doc.Paths.Map() {
 		methods := []string{}
 		if pathItem.Get != nil {
@@ -118,7 +158,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	// graceful shutdown
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -130,11 +169,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return srv.ListenAndServe()
 }
 
-// Store is the in-memory CRUD store
+// --------------- Store ---------------
+
 type Store struct {
 	mu      sync.RWMutex
-	data    map[string]map[string]interface{} // resource type -> id -> object
-	written map[string]bool                   // tracks if a resource has ever been written to
+	data    map[string]map[string]interface{}
+	written map[string]bool
 }
 
 func NewStore() *Store {
@@ -196,14 +236,16 @@ func (s *Store) Delete(resource, id string) bool {
 	return true
 }
 
-// MockServer handles all incoming requests
+// --------------- MockServer ---------------
+
 type MockServer struct {
-	doc   *openapi3.T
-	store *Store
-	seed  int64
+	doc    *openapi3.T
+	store  *Store
+	seed   int64
+	router routers.Router
+	noAuth bool
 }
 
-// path param regex: {param}
 var pathParamRe = regexp.MustCompile(`\{([^}]+)\}`)
 
 func (s *MockServer) findRoute(reqPath, reqMethod string) (*openapi3.PathItem, *openapi3.Operation, map[string]string) {
@@ -221,7 +263,6 @@ func (s *MockServer) findRoute(reqPath, reqMethod string) (*openapi3.PathItem, *
 }
 
 func matchPath(pattern, actual string) map[string]string {
-	// convert /users/{id} to regex
 	regexStr := "^" + pathParamRe.ReplaceAllString(pattern, `([^/]+)`) + "$"
 	re, err := regexp.Compile(regexStr)
 	if err != nil {
@@ -231,8 +272,6 @@ func matchPath(pattern, actual string) map[string]string {
 	if matches == nil {
 		return nil
 	}
-
-	// extract param names
 	paramNames := pathParamRe.FindAllStringSubmatch(pattern, -1)
 	params := make(map[string]string)
 	for i, name := range paramNames {
@@ -261,13 +300,369 @@ func getOperation(item *openapi3.PathItem, method string) *openapi3.Operation {
 	return nil
 }
 
+// --------------- Content Negotiation ---------------
+
+func negotiateContentType(r *http.Request) string {
+	accept := r.Header.Get("Accept")
+	if accept == "" || accept == "*/*" {
+		return "application/json"
+	}
+	for _, part := range strings.Split(accept, ",") {
+		mt := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		switch mt {
+		case "application/json", "*/*":
+			return "application/json"
+		case "application/xml", "text/xml":
+			return "application/xml"
+		}
+	}
+	return "" // unsupported
+}
+
+func writeResponse(w http.ResponseWriter, contentType string, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(statusCode)
+	if data == nil {
+		return
+	}
+	switch contentType {
+	case "application/xml", "text/xml":
+		writeXML(w, data)
+	default:
+		json.NewEncoder(w).Encode(data)
+	}
+}
+
+// XMLMap is a wrapper for encoding maps as XML
+type XMLMap struct {
+	XMLName xml.Name
+	Items   []XMLEntry
+}
+
+type XMLEntry struct {
+	XMLName xml.Name
+	Value   string `xml:",chardata"`
+	Items   []XMLEntry
+}
+
+func writeXML(w io.Writer, data interface{}) {
+	w.Write([]byte(xml.Header))
+	switch v := data.(type) {
+	case map[string]interface{}:
+		w.Write([]byte("<root>"))
+		writeXMLMap(w, v)
+		w.Write([]byte("</root>"))
+	case []interface{}:
+		w.Write([]byte("<root>"))
+		for _, item := range v {
+			w.Write([]byte("<item>"))
+			if m, ok := item.(map[string]interface{}); ok {
+				writeXMLMap(w, m)
+			} else {
+				fmt.Fprintf(w, "%v", item)
+			}
+			w.Write([]byte("</item>"))
+		}
+		w.Write([]byte("</root>"))
+	default:
+		fmt.Fprintf(w, "<root>%v</root>", v)
+	}
+}
+
+func writeXMLMap(w io.Writer, m map[string]interface{}) {
+	for k, v := range m {
+		safe := xml.EscapeText
+		_ = safe
+		fmt.Fprintf(w, "<%s>", k)
+		switch val := v.(type) {
+		case map[string]interface{}:
+			writeXMLMap(w, val)
+		case []interface{}:
+			for _, item := range val {
+				fmt.Fprintf(w, "<item>")
+				if m2, ok := item.(map[string]interface{}); ok {
+					writeXMLMap(w, m2)
+				} else {
+					buf := &bytes.Buffer{}
+					xml.EscapeText(buf, []byte(fmt.Sprintf("%v", item)))
+					w.Write(buf.Bytes())
+				}
+				fmt.Fprintf(w, "</item>")
+			}
+		default:
+			buf := &bytes.Buffer{}
+			xml.EscapeText(buf, []byte(fmt.Sprintf("%v", val)))
+			w.Write(buf.Bytes())
+		}
+		fmt.Fprintf(w, "</%s>", k)
+	}
+}
+
+// --------------- Auth Simulation ---------------
+
+func (s *MockServer) checkAuth(w http.ResponseWriter, r *http.Request, op *openapi3.Operation) bool {
+	if s.noAuth {
+		return true
+	}
+
+	// collect security requirements: operation-level or global
+	secReqs := op.Security
+	if secReqs == nil {
+		secReqs = &s.doc.Security
+	}
+	if secReqs == nil || len(*secReqs) == 0 {
+		return true
+	}
+
+	schemes := s.doc.Components
+	if schemes == nil {
+		return true
+	}
+
+	// any one security requirement set must pass (OR logic)
+	for _, reqSet := range *secReqs {
+		allPassed := true
+		for schemeName := range reqSet {
+			schemeRef, ok := schemes.SecuritySchemes[schemeName]
+			if !ok || schemeRef.Value == nil {
+				allPassed = false
+				break
+			}
+			ss := schemeRef.Value
+			switch ss.Type {
+			case "http":
+				auth := r.Header.Get("Authorization")
+				if auth == "" {
+					allPassed = false
+				} else if strings.ToLower(ss.Scheme) == "bearer" && !strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+					allPassed = false
+				}
+			case "apiKey":
+				switch ss.In {
+				case "header":
+					if r.Header.Get(ss.Name) == "" {
+						allPassed = false
+					}
+				case "query":
+					if r.URL.Query().Get(ss.Name) == "" {
+						allPassed = false
+					}
+				case "cookie":
+					if _, err := r.Cookie(ss.Name); err != nil {
+						allPassed = false
+					}
+				}
+			case "oauth2", "openIdConnect":
+				if r.Header.Get("Authorization") == "" {
+					allPassed = false
+				}
+			}
+			if !allPassed {
+				break
+			}
+		}
+		if allPassed {
+			return true
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(401)
+	json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+	return false
+}
+
+// --------------- Request Validation ---------------
+
+func (s *MockServer) validateRequest(w http.ResponseWriter, r *http.Request, body []byte) bool {
+	if s.router == nil {
+		return true
+	}
+
+	route, pathParams, err := s.router.FindRoute(r)
+	if err != nil {
+		return true // can't find route in validator, skip validation
+	}
+
+	input := &openapi3filter.RequestValidationInput{
+		Request:    r,
+		PathParams: pathParams,
+		Route:      route,
+		Options: &openapi3filter.Options{
+			AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
+		},
+	}
+
+	// restore body for validation
+	if len(body) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	err = openapi3filter.ValidateRequest(context.Background(), input)
+	if err != nil {
+		details := parseValidationError(err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "validation failed",
+			"details": details,
+		})
+		return false
+	}
+
+	// restore body again for handler
+	if len(body) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	return true
+}
+
+func parseValidationError(err error) []map[string]string {
+	details := []map[string]string{}
+	errStr := err.Error()
+
+	// extract only the meaningful error lines (property errors)
+	lines := strings.Split(errStr, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// only include lines with actual error info
+		if !strings.Contains(line, "property") && !strings.Contains(line, "error") && !strings.Contains(line, "must") && !strings.Contains(line, "invalid") {
+			continue
+		}
+		detail := map[string]string{}
+
+		// extract field name from "property "X" is missing" patterns
+		if strings.Contains(line, "property") {
+			parts := strings.SplitN(line, "property", 2)
+			if len(parts) > 1 {
+				fieldPart := strings.TrimSpace(parts[1])
+				if idx := strings.IndexByte(fieldPart, '"'); idx >= 0 {
+					end := strings.IndexByte(fieldPart[idx+1:], '"')
+					if end >= 0 {
+						detail["field"] = fieldPart[idx+1 : idx+1+end]
+					}
+				}
+			}
+			// simplify message
+			if field, ok := detail["field"]; ok {
+				if strings.Contains(line, "missing") {
+					detail["message"] = "required field missing"
+				} else {
+					detail["message"] = "invalid value for field " + field
+				}
+			} else {
+				detail["message"] = line
+			}
+		} else {
+			detail["message"] = line
+		}
+		details = append(details, detail)
+	}
+
+	if len(details) == 0 {
+		details = append(details, map[string]string{"message": errStr})
+	}
+	return details
+}
+
+// --------------- Prefer Header ---------------
+
+func parsePreferCode(r *http.Request) int {
+	prefer := r.Header.Get("Prefer")
+	if prefer == "" {
+		return 0
+	}
+	for _, part := range strings.Split(prefer, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "code=") {
+			code, err := strconv.Atoi(strings.TrimPrefix(part, "code="))
+			if err == nil {
+				return code
+			}
+		}
+	}
+	return 0
+}
+
+func (s *MockServer) handlePreferCode(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, contentType string) bool {
+	code := parsePreferCode(r)
+	if code == 0 {
+		return false
+	}
+
+	codeStr := strconv.Itoa(code)
+	schema := s.getResponseSchema(op, codeStr)
+	if schema != nil {
+		rng := seededRng(s.seed, r.URL.Path+codeStr)
+		fake := generateFromSchema(schema, rng, 0)
+		writeResponse(w, contentType, code, fake)
+	} else {
+		w.WriteHeader(code)
+	}
+	return true
+}
+
+// --------------- Query Param Filtering ---------------
+
+func applyQueryParams(items []interface{}, query url.Values) []interface{} {
+	// filter
+	for key, vals := range query {
+		if key == "limit" || key == "offset" {
+			continue
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		filterVal := vals[0]
+		filtered := make([]interface{}, 0)
+		for _, item := range items {
+			if m, ok := item.(map[string]interface{}); ok {
+				if v, exists := m[key]; exists {
+					if fmt.Sprintf("%v", v) == filterVal {
+						filtered = append(filtered, item)
+					}
+				}
+			}
+		}
+		items = filtered
+	}
+
+	// offset
+	if offsetStr := query.Get("offset"); offsetStr != "" {
+		if offset, err := strconv.Atoi(offsetStr); err == nil && offset > 0 {
+			if offset >= len(items) {
+				items = []interface{}{}
+			} else {
+				items = items[offset:]
+			}
+		}
+	}
+
+	// limit
+	if limitStr := query.Get("limit"); limitStr != "" {
+		if limit, err := strconv.Atoi(limitStr); err == nil && limit >= 0 {
+			if limit < len(items) {
+				items = items[:limit]
+			}
+		}
+	}
+
+	return items
+}
+
+// --------------- Main Request Handler ---------------
+
 func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// CORS
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Prefer, Accept")
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
 		return
@@ -294,44 +689,80 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// content negotiation
+	contentType := negotiateContentType(r)
+	if contentType == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(406)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not acceptable — supported: application/json, application/xml"})
+		log.Printf("⚠️ %s %s → 406 (%s)", r.Method, r.URL.Path, time.Since(start))
+		return
+	}
+
 	_, op, params := s.findRoute(r.URL.Path, r.Method)
 	if op == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "route not found"})
+		writeResponse(w, contentType, 404, map[string]string{"error": "route not found"})
 		log.Printf("❌ %s %s → 404 (%s)", r.Method, r.URL.Path, time.Since(start))
 		return
 	}
 
-	// determine resource name from path
+	// auth check
+	if !s.checkAuth(w, r, op) {
+		log.Printf("🔒 %s %s → 401 (%s)", r.Method, r.URL.Path, time.Since(start))
+		return
+	}
+
+	// read body for validation
+	var bodyBytes []byte
+	if r.Body != nil {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	// request validation
+	if len(bodyBytes) > 0 {
+		if !s.validateRequest(w, r, bodyBytes) {
+			log.Printf("⚠️ %s %s → 400 validation failed (%s)", r.Method, r.URL.Path, time.Since(start))
+			return
+		}
+	}
+
+	// restore body for handlers
+	if len(bodyBytes) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	// Prefer header
+	if s.handlePreferCode(w, r, op, contentType) {
+		log.Printf("🎯 %s %s → Prefer (%s)", r.Method, r.URL.Path, time.Since(start))
+		return
+	}
+
 	resource := extractResource(r.URL.Path)
 
-	// handle stateful CRUD
 	switch strings.ToUpper(r.Method) {
 	case "POST":
-		s.handlePost(w, r, op, resource)
+		s.handlePost(w, r, op, resource, contentType)
 	case "GET":
 		if id, ok := params["id"]; ok {
-			s.handleGetOne(w, r, op, resource, id)
+			s.handleGetOne(w, r, op, resource, id, contentType)
 		} else {
-			s.handleGetList(w, r, op, resource)
+			s.handleGetList(w, r, op, resource, contentType)
 		}
 	case "PUT", "PATCH":
 		if id, ok := params["id"]; ok {
-			s.handlePut(w, r, op, resource, id)
+			s.handlePut(w, r, op, resource, id, contentType)
 		} else {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "missing id"})
+			writeResponse(w, contentType, 400, map[string]string{"error": "missing id"})
 		}
 	case "DELETE":
 		if id, ok := params["id"]; ok {
 			s.handleDelete(w, r, resource, id)
 		} else {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "missing id"})
+			writeResponse(w, contentType, 400, map[string]string{"error": "missing id"})
 		}
 	default:
-		s.handleGeneric(w, r, op)
+		s.handleGeneric(w, r, op, contentType)
 	}
 
 	log.Printf("✅ %s %s (%s)", r.Method, r.URL.Path, time.Since(start))
@@ -342,13 +773,10 @@ func extractResource(path string) string {
 	if len(parts) == 0 {
 		return "root"
 	}
-	// use first path segment as resource name
 	return parts[0]
 }
 
-func (s *MockServer) handlePost(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource string) {
-	w.Header().Set("Content-Type", "application/json")
-
+func (s *MockServer) handlePost(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, contentType string) {
 	var body map[string]interface{}
 	if r.Body != nil {
 		json.NewDecoder(r.Body).Decode(&body)
@@ -357,7 +785,6 @@ func (s *MockServer) handlePost(w http.ResponseWriter, r *http.Request, op *open
 		body = make(map[string]interface{})
 	}
 
-	// generate an ID if not provided
 	if _, ok := body["id"]; !ok {
 		body["id"] = gofakeit.UUID()
 	}
@@ -365,67 +792,62 @@ func (s *MockServer) handlePost(w http.ResponseWriter, r *http.Request, op *open
 	id := fmt.Sprintf("%v", body["id"])
 	s.store.Put(resource, id, body)
 
-	w.WriteHeader(201)
-	json.NewEncoder(w).Encode(body)
+	writeResponse(w, contentType, 201, body)
 }
 
-func (s *MockServer) handleGetOne(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id string) {
-	w.Header().Set("Content-Type", "application/json")
-
+func (s *MockServer) handleGetOne(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id, contentType string) {
 	obj, ok := s.store.Get(resource, id)
 	if ok {
-		json.NewEncoder(w).Encode(obj)
+		writeResponse(w, contentType, 200, obj)
 		return
 	}
 
-	// generate fake response from schema
 	schema := s.getResponseSchema(op, "200")
 	if schema == nil {
 		schema = s.getResponseSchema(op, "201")
 	}
 	if schema != nil {
-		// seed based on path + id for consistency
 		rng := seededRng(s.seed, r.URL.Path)
 		fake := generateFromSchema(schema, rng, 0)
-		// set the id field to match
 		if m, ok := fake.(map[string]interface{}); ok {
 			m["id"] = id
 		}
-		json.NewEncoder(w).Encode(fake)
+		writeResponse(w, contentType, 200, fake)
 		return
 	}
 
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id})
+	writeResponse(w, contentType, 200, map[string]interface{}{"id": id})
 }
 
-func (s *MockServer) handleGetList(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource string) {
-	w.Header().Set("Content-Type", "application/json")
-
-	// if any POST has been made to this resource, only return stored items (even if empty)
+func (s *MockServer) handleGetList(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, contentType string) {
 	items := s.store.List(resource)
 	if s.store.HasBeenWritten(resource) {
-		json.NewEncoder(w).Encode(items)
+		items = applyQueryParams(items, r.URL.Query())
+		writeResponse(w, contentType, 200, items)
 		return
 	}
 
-	// no writes yet — generate fake seed data
 	if len(items) == 0 {
 		schema := s.getResponseSchema(op, "200")
 		if schema != nil {
 			rng := seededRng(s.seed, r.URL.Path)
 			fake := generateFromSchema(schema, rng, 0)
-			json.NewEncoder(w).Encode(fake)
+			// if fake data is an array, apply query params
+			if arr, ok := fake.([]interface{}); ok {
+				arr = applyQueryParams(arr, r.URL.Query())
+				writeResponse(w, contentType, 200, arr)
+				return
+			}
+			writeResponse(w, contentType, 200, fake)
 			return
 		}
 	}
 
-	json.NewEncoder(w).Encode(items)
+	items = applyQueryParams(items, r.URL.Query())
+	writeResponse(w, contentType, 200, items)
 }
 
-func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id string) {
-	w.Header().Set("Content-Type", "application/json")
-
+func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id, contentType string) {
 	var body map[string]interface{}
 	if r.Body != nil {
 		json.NewDecoder(r.Body).Decode(&body)
@@ -435,7 +857,6 @@ func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *opena
 	}
 	body["id"] = id
 
-	// merge with existing if PATCH-like
 	existing, ok := s.store.Get(resource, id)
 	if ok {
 		if existingMap, ok := existing.(map[string]interface{}); ok {
@@ -447,26 +868,23 @@ func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *opena
 	}
 
 	s.store.Put(resource, id, body)
-	json.NewEncoder(w).Encode(body)
+	writeResponse(w, contentType, 200, body)
 }
 
 func (s *MockServer) handleDelete(w http.ResponseWriter, r *http.Request, resource, id string) {
-	w.Header().Set("Content-Type", "application/json")
 	s.store.Delete(resource, id)
 	w.WriteHeader(204)
 }
 
-func (s *MockServer) handleGeneric(w http.ResponseWriter, r *http.Request, op *openapi3.Operation) {
-	w.Header().Set("Content-Type", "application/json")
+func (s *MockServer) handleGeneric(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, contentType string) {
 	schema := s.getResponseSchema(op, "200")
 	if schema != nil {
 		rng := seededRng(s.seed, r.URL.Path)
 		fake := generateFromSchema(schema, rng, 0)
-		json.NewEncoder(w).Encode(fake)
+		writeResponse(w, contentType, 200, fake)
 		return
 	}
-	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	writeResponse(w, contentType, 200, map[string]string{"status": "ok"})
 }
 
 func (s *MockServer) getResponseSchema(op *openapi3.Operation, statusCode string) *openapi3.SchemaRef {
@@ -486,6 +904,235 @@ func (s *MockServer) getResponseSchema(op *openapi3.Operation, statusCode string
 	}
 	return ct.Schema
 }
+
+// --------------- Proxy Mode ---------------
+
+func runProxy(cmd *cobra.Command, args []string) error {
+	specFile := args[0]
+	target, _ := cmd.Flags().GetString("target")
+	recordFile, _ := cmd.Flags().GetString("record")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromFile(specFile)
+	if err != nil {
+		return fmt.Errorf("failed to load spec: %w", err)
+	}
+	if err := doc.Validate(context.Background()); err != nil {
+		log.Printf("warning: spec validation issues: %v", err)
+	}
+
+	router, err := gorillamux.NewRouter(doc)
+	if err != nil {
+		log.Printf("warning: could not build validation router: %v", err)
+	}
+
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+
+	var recorder *Recorder
+	if recordFile != "" {
+		recorder = NewRecorder(recordFile)
+		defer recorder.Close()
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = targetURL.Host
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// validate response
+		if router != nil {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			route, pathParams, err := router.FindRoute(resp.Request)
+			if err == nil {
+				input := &openapi3filter.RequestValidationInput{
+					Request:    resp.Request,
+					PathParams: pathParams,
+					Route:      route,
+					Options:    &openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+				}
+				respInput := &openapi3filter.ResponseValidationInput{
+					RequestValidationInput: input,
+					Status:                 resp.StatusCode,
+					Header:                 resp.Header,
+					Body:                   io.NopCloser(bytes.NewReader(bodyBytes)),
+				}
+				respInput.SetBodyBytes(bodyBytes)
+				if err := openapi3filter.ValidateResponse(context.Background(), respInput); err != nil {
+					log.Printf("⚠️ RESPONSE VALIDATION: %s %s → %v", resp.Request.Method, resp.Request.URL.Path, err)
+				}
+			}
+
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			// record
+			if recorder != nil {
+				recorder.Record(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode, bodyBytes)
+			}
+		}
+		return nil
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// validate request
+		if router != nil {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			route, pathParams, err := router.FindRoute(r)
+			if err == nil {
+				input := &openapi3filter.RequestValidationInput{
+					Request:    r,
+					PathParams: pathParams,
+					Route:      route,
+					Options:    &openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+				}
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				if err := openapi3filter.ValidateRequest(context.Background(), input); err != nil {
+					log.Printf("⚠️ REQUEST VALIDATION: %s %s → %v", r.Method, r.URL.Path, err)
+				}
+			}
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		proxy.ServeHTTP(w, r)
+	})
+
+	addr := fmt.Sprintf(":%d", port)
+	srv := &http.Server{Addr: addr, Handler: handler}
+
+	fmt.Printf("\n  ⬛ portblock proxy v%s\n", version)
+	fmt.Printf("  spec:   %s\n", specFile)
+	fmt.Printf("  target: %s\n", target)
+	fmt.Printf("  port:   %d\n", port)
+	if recordFile != "" {
+		fmt.Printf("  record: %s\n", recordFile)
+	}
+	fmt.Printf("\n  proxying at http://localhost:%d\n\n", port)
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		fmt.Println("\nshutting down...")
+		srv.Shutdown(context.Background())
+	}()
+
+	return srv.ListenAndServe()
+}
+
+// --------------- Recorder ---------------
+
+type Recording struct {
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
+}
+
+type Recorder struct {
+	mu         sync.Mutex
+	file       *os.File
+	recordings []Recording
+}
+
+func NewRecorder(path string) *Recorder {
+	f, err := os.Create(path)
+	if err != nil {
+		log.Printf("warning: could not create recording file: %v", err)
+		return &Recorder{}
+	}
+	return &Recorder{file: f}
+}
+
+func (r *Recorder) Record(method, path string, status int, body []byte) {
+	if r.file == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec := Recording{
+		Method: method,
+		Path:   path,
+		Status: status,
+		Body:   json.RawMessage(body),
+	}
+	r.recordings = append(r.recordings, rec)
+}
+
+func (r *Recorder) Close() {
+	if r.file == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	json.NewEncoder(r.file).Encode(r.recordings)
+	r.file.Close()
+}
+
+// --------------- Replay Mode ---------------
+
+func runReplay(cmd *cobra.Command, args []string) error {
+	recordFile := args[0]
+	data, err := os.ReadFile(recordFile)
+	if err != nil {
+		return fmt.Errorf("failed to read recordings: %w", err)
+	}
+
+	var recordings []Recording
+	if err := json.Unmarshal(data, &recordings); err != nil {
+		return fmt.Errorf("failed to parse recordings: %w", err)
+	}
+
+	// build lookup: method+path -> recording
+	lookup := make(map[string]Recording)
+	for _, rec := range recordings {
+		key := rec.Method + " " + rec.Path
+		lookup[key] = rec
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Method + " " + r.URL.Path
+		rec, ok := lookup[key]
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no recording for " + key})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rec.Status)
+		w.Write(rec.Body)
+	})
+
+	addr := fmt.Sprintf(":%d", port)
+	srv := &http.Server{Addr: addr, Handler: handler}
+
+	fmt.Printf("\n  ⬛ portblock replay v%s\n", version)
+	fmt.Printf("  file: %s\n", recordFile)
+	fmt.Printf("  port: %d\n", port)
+	fmt.Printf("  entries: %d\n", len(recordings))
+	fmt.Printf("\n  replaying at http://localhost:%d\n\n", port)
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		fmt.Println("\nshutting down...")
+		srv.Shutdown(context.Background())
+	}()
+
+	return srv.ListenAndServe()
+}
+
+// --------------- Fake Data Generation ---------------
 
 func seededRng(baseSeed int64, path string) *rand.Rand {
 	h := baseSeed
@@ -508,7 +1155,6 @@ func generateFromSchema(ref *openapi3.SchemaRef, rng *rand.Rand, depth int) inte
 		return nil
 	}
 
-	// handle allOf
 	if len(schema.AllOf) > 0 {
 		result := make(map[string]interface{})
 		for _, sub := range schema.AllOf {
@@ -522,7 +1168,6 @@ func generateFromSchema(ref *openapi3.SchemaRef, rng *rand.Rand, depth int) inte
 		return result
 	}
 
-	// handle oneOf/anyOf — pick first
 	if len(schema.OneOf) > 0 {
 		return generateFromSchema(schema.OneOf[0], rng, depth+1)
 	}
@@ -530,12 +1175,20 @@ func generateFromSchema(ref *openapi3.SchemaRef, rng *rand.Rand, depth int) inte
 		return generateFromSchema(schema.AnyOf[0], rng, depth+1)
 	}
 
-	// use example if available
 	if schema.Example != nil {
 		return schema.Example
 	}
 
-	switch schema.Type.Slice()[0] {
+	types := schema.Type.Slice()
+	if len(types) == 0 {
+		// no type specified, try to infer from properties
+		if len(schema.Properties) > 0 {
+			return generateObject(schema, rng, depth)
+		}
+		return "unknown"
+	}
+
+	switch types[0] {
 	case "object":
 		return generateObject(schema, rng, depth)
 	case "array":
@@ -570,14 +1223,13 @@ func generateFromSchemaWithName(ref *openapi3.SchemaRef, rng *rand.Rand, depth i
 		return nil
 	}
 
-	// for strings, use property-name-aware generation
-	if len(schema.Type.Slice()) > 0 && schema.Type.Slice()[0] == "string" && schema.Format == "" && len(schema.Enum) == 0 {
+	types := schema.Type.Slice()
+	if len(types) > 0 && types[0] == "string" && schema.Format == "" && len(schema.Enum) == 0 {
 		if v, ok := generateStringByName(propName, rng); ok {
 			return v
 		}
 	}
 
-	// also check examples on the schema
 	if schema.Example != nil {
 		return schema.Example
 	}
@@ -586,7 +1238,7 @@ func generateFromSchemaWithName(ref *openapi3.SchemaRef, rng *rand.Rand, depth i
 }
 
 func generateArray(schema *openapi3.Schema, rng *rand.Rand, depth int) interface{} {
-	count := 2 + rng.Intn(4) // 2-5 items
+	count := 2 + rng.Intn(4)
 	items := make([]interface{}, count)
 	for i := range items {
 		items[i] = generateFromSchema(schema.Items, rng, depth+1)
@@ -599,7 +1251,6 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 	name := strings.ToLower(propName)
 
 	switch {
-	// names
 	case name == "name" || name == "full_name" || name == "fullname":
 		return faker.Name(), true
 	case name == "first_name" || name == "firstname" || name == "given_name":
@@ -608,14 +1259,10 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 		return faker.LastName(), true
 	case name == "username" || name == "user_name" || name == "handle" || name == "login":
 		return faker.Username(), true
-
-	// contact
 	case name == "email" || name == "email_address" || strings.HasSuffix(name, "_email"):
 		return faker.Email(), true
 	case name == "phone" || name == "phone_number" || name == "mobile" || name == "tel":
 		return faker.Phone(), true
-
-	// location
 	case name == "address" || name == "street" || name == "street_address":
 		return faker.Street(), true
 	case name == "city":
@@ -630,8 +1277,6 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 		return fmt.Sprintf("%.6f", faker.Latitude()), true
 	case name == "longitude" || name == "lng" || name == "lon":
 		return fmt.Sprintf("%.6f", faker.Longitude()), true
-
-	// text content
 	case name == "title" || name == "subject" || name == "headline":
 		return faker.Sentence(3 + rng.Intn(4)), true
 	case name == "description" || name == "summary" || name == "bio" || name == "about":
@@ -640,8 +1285,6 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 		return faker.Paragraph(1, 3, 5, " "), true
 	case name == "comment" || name == "note" || name == "notes":
 		return faker.Sentence(5 + rng.Intn(6)), true
-
-	// web
 	case name == "url" || name == "website" || name == "link" || name == "homepage":
 		return faker.URL(), true
 	case name == "image" || name == "avatar" || name == "photo" || name == "picture" || name == "image_url" || name == "avatar_url":
@@ -650,24 +1293,18 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 		return faker.DomainName(), true
 	case name == "ip" || name == "ip_address":
 		return faker.IPv4Address(), true
-
-	// identifiers
 	case name == "slug":
 		return strings.ToLower(strings.ReplaceAll(faker.BuzzWord()+" "+faker.BuzzWord(), " ", "-")), true
 	case name == "sku" || name == "code" || name == "product_code":
 		return faker.LetterN(3) + "-" + fmt.Sprintf("%04d", rng.Intn(10000)), true
 	case name == "color" || name == "colour":
 		return faker.Color(), true
-
-	// business
 	case name == "company" || name == "company_name" || name == "organization" || name == "org":
 		return faker.Company(), true
 	case name == "job" || name == "job_title" || name == "role" || name == "position":
 		return faker.JobTitle(), true
 	case name == "industry" || name == "sector":
 		return faker.JobDescriptor(), true
-
-	// misc
 	case name == "currency" || name == "currency_code":
 		return faker.CurrencyShort(), true
 	case name == "language" || name == "lang" || name == "locale":
@@ -687,7 +1324,6 @@ func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
 func generateString(schema *openapi3.Schema, rng *rand.Rand) string {
 	faker := gofakeit.New(uint64(rng.Int63()))
 
-	// check enum
 	if len(schema.Enum) > 0 {
 		return fmt.Sprintf("%v", schema.Enum[rng.Intn(len(schema.Enum))])
 	}
@@ -713,18 +1349,14 @@ func generateString(schema *openapi3.Schema, rng *rand.Rand) string {
 		return faker.Password(true, true, true, false, false, 12)
 	}
 
-	// generate a realistic string based on length constraints
 	maxLen := 100
 	if schema.MaxLength != nil {
 		maxLen = int(*schema.MaxLength)
 	}
 
-	// generate a full sentence
 	s := faker.Sentence(5 + rng.Intn(8))
-	// trim trailing period for cleaner look
 	s = strings.TrimSuffix(s, ".")
 	if len(s) > maxLen {
-		// truncate at last word boundary
 		s = s[:maxLen]
 		if idx := strings.LastIndex(s, " "); idx > 0 {
 			s = s[:idx]
@@ -758,10 +1390,4 @@ func generateNumber(schema *openapi3.Schema, rng *rand.Rand) float64 {
 		max = *schema.Max
 	}
 	return min + rng.Float64()*(max-min)
-}
-
-// used by handleGetOne to try to parse path param as resource identifier
-func init() {
-	// suppress unused import
-	_ = strconv.Itoa
 }
