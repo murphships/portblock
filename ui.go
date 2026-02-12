@@ -2,15 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	clog "github.com/charmbracelet/log"
 )
-
-var _ = os.Stderr // keep import
 
 // color palette — dark theme friendly, tasteful
 var (
@@ -77,16 +73,6 @@ var (
 			MarginLeft(1).
 			Italic(true)
 )
-
-// logger is the charmbracelet logger for request logging
-var logger *clog.Logger
-
-func init() {
-	logger = clog.NewWithOptions(os.Stderr, clog.Options{
-		ReportTimestamp: true,
-		TimeFormat:      "15:04:05",
-	})
-}
 
 // methodStyle returns the colored style for an HTTP method
 func methodStyle(method string) lipgloss.Style {
@@ -186,10 +172,7 @@ func renderRoutes(routes []routeInfo) string {
 
 	for _, r := range routes {
 		methods := ""
-		for i, m := range r.methods {
-			if i > 0 {
-				methods += styleSeparator.Render(",")
-			}
+		for _, m := range r.methods {
 			methods += methodStyle(m).Render(m)
 		}
 		b.WriteString("  " + methods + stylePath.Render(r.path) + "\n")

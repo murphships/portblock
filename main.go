@@ -157,7 +157,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		srv.Shutdown(context.Background())
 	}()
 
-	return srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 // --------------- Store ---------------
@@ -1010,7 +1013,7 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		srv.Shutdown(context.Background())
 	}()
 
-	return srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { return err }; return nil
 }
 
 // --------------- Recorder ---------------
@@ -1111,7 +1114,7 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		srv.Shutdown(context.Background())
 	}()
 
-	return srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { return err }; return nil
 }
 
 // --------------- Fake Data Generation ---------------
