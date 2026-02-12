@@ -8,11 +8,31 @@ think prism, but your mock actually remembers things.
 
 ## install
 
+### homebrew (macOS/linux)
+
+```bash
+brew install murphships/tap/portblock
+```
+
+### go install
+
 ```bash
 go install github.com/murphships/portblock@latest
 ```
 
-or clone and build:
+### binary download
+
+grab the latest binary from [releases](https://github.com/murphships/portblock/releases):
+
+```bash
+# linux amd64
+curl -Lo portblock.tar.gz https://github.com/murphships/portblock/releases/latest/download/portblock_linux_amd64.tar.gz
+tar xzf portblock.tar.gz
+sudo mv portblock /usr/local/bin/
+```
+
+### build from source
+
 ```bash
 git clone https://github.com/murphships/portblock.git
 cd portblock
