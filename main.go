@@ -7,7 +7,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	stdlog "log"
 	"math/rand"
 	"net/http"
 	"net/http/httputil"
@@ -96,7 +96,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := doc.Validate(context.Background()); err != nil {
-		log.Printf("warning: spec validation issues: %v", err)
+		stdlog.Printf("warning: spec validation issues: %v", err)
 	}
 
 	if seed == 0 {
@@ -105,7 +105,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	router, err := gorillamux.NewRouter(doc)
 	if err != nil {
-		log.Printf("warning: could not build validation router: %v", err)
+		stdlog.Printf("warning: could not build validation router: %v", err)
 	}
 
 	server := &MockServer{
@@ -122,21 +122,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{Addr: addr, Handler: mux}
 
-	fmt.Printf("\n  ⬛ portblock v%s\n", version)
-	fmt.Printf("  spec:  %s\n", specFile)
-	fmt.Printf("  port:  %d\n", port)
-	fmt.Printf("  seed:  %d\n", seed)
-	if delay > 0 {
-		fmt.Printf("  delay: %s\n", delay)
-	}
-	if chaos {
-		fmt.Printf("  chaos: enabled 💥\n")
-	}
-	if noAuth {
-		fmt.Printf("  auth:  disabled\n")
-	}
-	fmt.Printf("\n  ready at http://localhost:%d\n\n", port)
+	// render banner
+	fmt.Println(renderBanner("serve", specFile, port, seed, delay, chaos, noAuth))
 
+	// collect and render routes
+	var routes []routeInfo
 	for path, pathItem := range doc.Paths.Map() {
 		methods := []string{}
 		if pathItem.Get != nil {
@@ -154,15 +144,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if pathItem.Delete != nil {
 			methods = append(methods, "DELETE")
 		}
-		fmt.Printf("  %s %s\n", strings.Join(methods, ","), path)
+		routes = append(routes, routeInfo{path: path, methods: methods})
 	}
-	fmt.Println()
+	fmt.Print(renderRoutes(routes))
+	fmt.Print(renderReady(port))
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		fmt.Println("\nshutting down...")
+		fmt.Print(renderShutdown())
 		srv.Shutdown(context.Background())
 	}()
 
@@ -680,7 +671,7 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": "chaos mode struck 💥"})
-			log.Printf("💥 CHAOS %s %s → 500 (%s)", r.Method, r.URL.Path, time.Since(start))
+			logChaos(r.Method, r.URL.Path, time.Since(start))
 			return
 		}
 		if chaosRng.Float64() < 0.2 {
@@ -695,20 +686,20 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(406)
 		json.NewEncoder(w).Encode(map[string]string{"error": "not acceptable — supported: application/json, application/xml"})
-		log.Printf("⚠️ %s %s → 406 (%s)", r.Method, r.URL.Path, time.Since(start))
+		logRequest(r.Method, r.URL.Path, 406, time.Since(start))
 		return
 	}
 
 	_, op, params := s.findRoute(r.URL.Path, r.Method)
 	if op == nil {
 		writeResponse(w, contentType, 404, map[string]string{"error": "route not found"})
-		log.Printf("❌ %s %s → 404 (%s)", r.Method, r.URL.Path, time.Since(start))
+		logRequest(r.Method, r.URL.Path, 404, time.Since(start))
 		return
 	}
 
 	// auth check
 	if !s.checkAuth(w, r, op) {
-		log.Printf("🔒 %s %s → 401 (%s)", r.Method, r.URL.Path, time.Since(start))
+		logRequest(r.Method, r.URL.Path, 401, time.Since(start))
 		return
 	}
 
@@ -722,7 +713,7 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// request validation
 	if len(bodyBytes) > 0 {
 		if !s.validateRequest(w, r, bodyBytes) {
-			log.Printf("⚠️ %s %s → 400 validation failed (%s)", r.Method, r.URL.Path, time.Since(start))
+			logRequestValidationError(r.Method, r.URL.Path, time.Since(start))
 			return
 		}
 	}
@@ -734,7 +725,7 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Prefer header
 	if s.handlePreferCode(w, r, op, contentType) {
-		log.Printf("🎯 %s %s → Prefer (%s)", r.Method, r.URL.Path, time.Since(start))
+		logRequest(r.Method, r.URL.Path, parsePreferCode(r), time.Since(start))
 		return
 	}
 
@@ -765,7 +756,7 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.handleGeneric(w, r, op, contentType)
 	}
 
-	log.Printf("✅ %s %s (%s)", r.Method, r.URL.Path, time.Since(start))
+	logRequest(r.Method, r.URL.Path, 200, time.Since(start))
 }
 
 func extractResource(path string) string {
@@ -918,12 +909,12 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load spec: %w", err)
 	}
 	if err := doc.Validate(context.Background()); err != nil {
-		log.Printf("warning: spec validation issues: %v", err)
+		stdlog.Printf("warning: spec validation issues: %v", err)
 	}
 
 	router, err := gorillamux.NewRouter(doc)
 	if err != nil {
-		log.Printf("warning: could not build validation router: %v", err)
+		stdlog.Printf("warning: could not build validation router: %v", err)
 	}
 
 	targetURL, err := url.Parse(target)
@@ -966,7 +957,7 @@ func runProxy(cmd *cobra.Command, args []string) error {
 				}
 				respInput.SetBodyBytes(bodyBytes)
 				if err := openapi3filter.ValidateResponse(context.Background(), respInput); err != nil {
-					log.Printf("⚠️ RESPONSE VALIDATION: %s %s → %v", resp.Request.Method, resp.Request.URL.Path, err)
+					logProxyValidation("RESPONSE", resp.Request.Method, resp.Request.URL.Path, err)
 				}
 			}
 
@@ -996,7 +987,7 @@ func runProxy(cmd *cobra.Command, args []string) error {
 				}
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 				if err := openapi3filter.ValidateRequest(context.Background(), input); err != nil {
-					log.Printf("⚠️ REQUEST VALIDATION: %s %s → %v", r.Method, r.URL.Path, err)
+					logProxyValidation("REQUEST", r.Method, r.URL.Path, err)
 				}
 			}
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -1008,20 +999,14 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{Addr: addr, Handler: handler}
 
-	fmt.Printf("\n  ⬛ portblock proxy v%s\n", version)
-	fmt.Printf("  spec:   %s\n", specFile)
-	fmt.Printf("  target: %s\n", target)
-	fmt.Printf("  port:   %d\n", port)
-	if recordFile != "" {
-		fmt.Printf("  record: %s\n", recordFile)
-	}
-	fmt.Printf("\n  proxying at http://localhost:%d\n\n", port)
+	fmt.Println(renderProxyBanner(specFile, target, port, recordFile))
+	fmt.Print(renderReady(port))
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		fmt.Println("\nshutting down...")
+		fmt.Print(renderShutdown())
 		srv.Shutdown(context.Background())
 	}()
 
@@ -1046,7 +1031,7 @@ type Recorder struct {
 func NewRecorder(path string) *Recorder {
 	f, err := os.Create(path)
 	if err != nil {
-		log.Printf("warning: could not create recording file: %v", err)
+		stdlog.Printf("warning: could not create recording file: %v", err)
 		return &Recorder{}
 	}
 	return &Recorder{file: f}
@@ -1115,17 +1100,14 @@ func runReplay(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{Addr: addr, Handler: handler}
 
-	fmt.Printf("\n  ⬛ portblock replay v%s\n", version)
-	fmt.Printf("  file: %s\n", recordFile)
-	fmt.Printf("  port: %d\n", port)
-	fmt.Printf("  entries: %d\n", len(recordings))
-	fmt.Printf("\n  replaying at http://localhost:%d\n\n", port)
+	fmt.Println(renderReplayBanner(recordFile, port, len(recordings)))
+	fmt.Print(renderReady(port))
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		fmt.Println("\nshutting down...")
+		fmt.Print(renderShutdown())
 		srv.Shutdown(context.Background())
 	}()
 

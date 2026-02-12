@@ -3,3 +3,9 @@ portblock
 *.exe
 dist/
 *.log
+node_modules/
+bun.lockb
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+index.ts
+CLAUDE.md
