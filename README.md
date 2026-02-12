@@ -20,9 +20,32 @@ brew install murphships/tap/portblock
 go install github.com/murphships/portblock@latest
 ```
 
+### scoop (windows)
+
+```powershell
+scoop bucket add murphships https://github.com/murphships/scoop-bucket
+scoop install portblock
+```
+
+### apt (debian/ubuntu)
+
+```bash
+# download the .deb from releases
+curl -Lo portblock.deb https://github.com/murphships/portblock/releases/latest/download/portblock_amd64.deb
+sudo dpkg -i portblock.deb
+```
+
+### rpm (fedora/rhel)
+
+```bash
+# download the .rpm from releases
+curl -Lo portblock.rpm https://github.com/murphships/portblock/releases/latest/download/portblock_amd64.rpm
+sudo rpm -i portblock.rpm
+```
+
 ### binary download
 
-grab the latest binary from [releases](https://github.com/murphships/portblock/releases):
+grab the latest binary from [releases](https://github.com/murphships/portblock/releases) — available for linux, macos, and windows (amd64/arm64).
 
 ```bash
 # linux amd64

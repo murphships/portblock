@@ -41,6 +41,27 @@ changelog:
       - "^ci:"
       - "^chore:"
 
+# --- Linux packages ---
+nfpms:
+  - id: portblock
+    package_name: portblock
+    vendor: murphships
+    homepage: "https://github.com/murphships/portblock"
+    maintainer: "Murph <murphships@gmail.com>"
+    description: "mock APIs that actually behave like real ones"
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/portblock/LICENSE
+
+# --- Homebrew ---
 brews:
   - repository:
       owner: murphships
@@ -54,6 +75,16 @@ brews:
       system "#{bin}/portblock", "--help"
     install: |
       bin.install "portblock"
+
+# --- Windows Scoop ---
+scoops:
+  - repository:
+      owner: murphships
+      name: scoop-bucket
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    homepage: "https://github.com/murphships/portblock"
+    description: "mock APIs that actually behave like real ones"
+    license: MIT
 
 release:
   github:
