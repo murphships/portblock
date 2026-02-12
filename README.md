@@ -1,10 +1,10 @@
-# ⬛ portblock
+# 🔌 portblock
 
 mock APIs that actually behave like real ones.
 
-you know prism? cool tool. but your mock forgets everything the moment you POST something. portblock doesn't. it's a mock server with memory.
+you give it an OpenAPI spec. it gives you a working API server with realistic data, stateful CRUD, and request validation. no config files. no examples needed in your spec. one binary.
 
-give it an OpenAPI spec, get a server that does real CRUD — POST creates a resource, GET retrieves it, PUT updates it, DELETE removes it. like a real API. because your frontend shouldn't have to pretend.
+think prism, but your mock actually remembers things.
 
 ## install
 
@@ -13,116 +13,191 @@ go install github.com/murphships/portblock@latest
 ```
 
 or clone and build:
-
 ```bash
 git clone https://github.com/murphships/portblock.git
 cd portblock
 go build -o portblock .
 ```
 
-## usage
+## quick start
 
 ```bash
+# spin up a mock server
 portblock serve api.yaml
+
+# that's it. you now have a working API at localhost:4000
 ```
 
-that's it. zero config. it reads your spec, spins up a server on `:4000`, and starts serving realistic fake data.
+## features
 
-```
-  ⬛ portblock v0.1.0
-  spec:  api.yaml
-  port:  4000
-  seed:  42
+### smart fake data
 
-  ready at http://localhost:4000
-
-  GET,POST /todos
-  GET,PUT,DELETE /todos/{id}
-```
-
-## stateful CRUD
-
-this is the whole point. your mock actually remembers things.
+portblock reads your schema types AND property names to generate realistic data. no `examples` required in your spec.
 
 ```bash
-# create a todo
-curl -X POST http://localhost:4000/todos \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"ship portblock","description":"make it work"}'
+curl localhost:4000/users | jq '.[0]'
+```
+```json
+{
+  "id": "6e759b9a-874f-4a43-aaee-c810d8151d86",
+  "name": "Johnathon Braun",
+  "username": "theKoch",
+  "email": "kaleyboyer@garcia.net",
+  "company": "Development Seed",
+  "job_title": "Hotel Manager",
+  "city": "Boston",
+  "country": "Brunei Darussalam",
+  "bio": "Publish a changelog entry for the child.",
+  "avatar": "https://picsum.photos/seed/5204/640/480",
+  "status": "active"
+}
+```
 
-# → {"id":"3b1351bf-...","title":"ship portblock","description":"make it work"}
+it knows `name` = person name, `email` = email, `city` = city, `company` = company name. 60+ field patterns built in.
+
+### stateful CRUD
+
+this is the big one. POST actually creates something. GET returns what you created. DELETE removes it. your mock behaves like a real API.
+
+```bash
+# create a user
+curl -X POST localhost:4000/users \
+  -H "Content-Type: application/json" \
+  -d '{"name":"murph","email":"murph@dev.io"}'
 
 # get it back
-curl http://localhost:4000/todos/3b1351bf-...
-
-# → same object. because it remembers.
-
-# update it
-curl -X PUT http://localhost:4000/todos/3b1351bf-... \
-  -H 'Content-Type: application/json' \
-  -d '{"completed":true}'
+curl localhost:4000/users
+# → returns only your created user
 
 # delete it
-curl -X DELETE http://localhost:4000/todos/3b1351bf-...
-# → 204. gone.
+curl -X DELETE localhost:4000/users/[id]
+
+# it's gone
+curl localhost:4000/users
+# → []
 ```
 
-## smart fake data
+prism returns the same static response every time. portblock gives you a working API.
 
-portblock reads your schema types and generates realistic data. no `examples` needed.
+### request validation
 
-- `string` with `format: email` → `angelobarnes@swift.org`
-- `string` with `format: date-time` → `2024-03-15T10:30:00Z`
-- `string` with `format: uuid` → proper UUID
-- `integer` → sensible random number (respects min/max)
-- `boolean` → random true/false
-- `$ref` → resolves and generates
-- `array` → 2-5 items
-- `enum` → picks from your values
-
-## flags
+portblock validates incoming requests against your spec. bad request? you get a helpful 400.
 
 ```bash
-portblock serve api.yaml --port 8080        # custom port
-portblock serve api.yaml --seed 42          # reproducible data
-portblock serve api.yaml --delay 200ms      # simulate latency
-portblock serve api.yaml --chaos            # random 500s and latency spikes 💥
+curl -X POST localhost:4000/users \
+  -H "Content-Type: application/json" \
+  -d '{"wrong_field": true}'
+
+# → 400 {"error": "validation failed", "details": [...]}
 ```
 
-| flag | default | what it does |
-|------|---------|-------------|
-| `--port, -p` | 4000 | port to listen on |
-| `--seed` | random | seed for reproducible fake data |
-| `--delay` | 0 | simulated latency per request |
-| `--chaos` | false | 10% chance of 500, random latency spikes |
+### prefer header
 
-## vs prism
+test error handling by forcing any response code:
 
-| feature | prism | portblock |
-|---------|-------|-----------|
-| reads OpenAPI spec | ✅ | ✅ |
-| generates fake data | ✅ | ✅ |
-| stateful CRUD | ❌ | ✅ |
-| consistent responses | ❌ | ✅ (seeded) |
-| chaos mode | ❌ | ✅ |
-| single binary | ❌ (node) | ✅ (go) |
-| zero config | ✅ | ✅ |
+```bash
+curl -H "Prefer: code=404" localhost:4000/users
+# → 404 with the response schema from your spec
 
-prism is great for "does my spec look right?" portblock is great for "i need to actually build a frontend against this."
+curl -H "Prefer: code=500" localhost:4000/users
+# → 500
+```
 
-## how it works
+### query parameters
 
-1. reads your OpenAPI 3.x spec with [kin-openapi](https://github.com/getkin/kin-openapi)
-2. registers routes for every path in your spec
-3. POST/PUT → stores in memory, GET → retrieves, DELETE → removes
-4. if no stored data exists for a GET, generates fake data from your schema
-5. fake data is seeded per-path so the same GET returns the same data
-6. CORS is enabled by default because we're not animals
+```bash
+# pagination
+curl "localhost:4000/users?limit=10&offset=5"
+
+# filtering
+curl "localhost:4000/users?status=active"
+```
+
+### auth simulation
+
+if your spec defines security schemes, portblock enforces them:
+
+```bash
+# no token → 401
+curl localhost:4000/users
+# → {"error": "unauthorized"}
+
+# with token → 200
+curl -H "Authorization: Bearer anything" localhost:4000/users
+# → works
+
+# skip auth entirely
+portblock serve api.yaml --no-auth
+```
+
+### proxy mode
+
+forward to a real API and validate both request and response against your spec:
+
+```bash
+# proxy and validate
+portblock proxy api.yaml --target https://api.production.com
+
+# proxy, validate, AND record responses
+portblock proxy api.yaml --target https://api.production.com --record
+
+# replay recorded responses (offline testing)
+portblock replay recordings.json
+```
+
+### chaos mode
+
+test your app's resilience:
+
+```bash
+portblock serve api.yaml --chaos
+# → 10% of requests return 500
+# → random latency spikes up to 2s
+```
+
+### more flags
+
+```bash
+portblock serve api.yaml \
+  --port 8080 \          # custom port (default: 4000)
+  --seed 42 \            # reproducible fake data
+  --delay 200ms \        # simulate network latency
+  --chaos \              # random failures
+  --no-auth              # skip auth checks
+```
+
+## how it compares
+
+| feature | portblock | prism | mockoon | wiremock | mockserver |
+|---------|-----------|-------|---------|----------|------------|
+| **zero config** | ✅ one command | ✅ | ❌ GUI setup | ❌ JSON config | ❌ code/config |
+| **stateful CRUD** | ✅ | ❌ | ❌ | ⚠️ complex setup | ❌ |
+| **smart fake data** | ✅ field inference | ⚠️ needs examples | ❌ manual | ❌ manual | ❌ manual |
+| **request validation** | ✅ | ✅ | ❌ | ✅ | ✅ |
+| **response codes (Prefer)** | ✅ | ✅ | ❌ | ⚠️ config needed | ⚠️ config needed |
+| **auth simulation** | ✅ auto from spec | ❌ | ⚠️ manual rules | ⚠️ manual rules | ⚠️ manual rules |
+| **proxy + validate** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **record/replay** | ✅ | ❌ | ❌ | ✅ | ✅ |
+| **chaos/fault injection** | ✅ built-in flag | ⚠️ limited | ⚠️ manual | ✅ | ✅ |
+| **query filtering** | ✅ | ❌ | ❌ | ⚠️ matching rules | ⚠️ matching rules |
+| **single binary** | ✅ Go | ❌ Node.js | ❌ Electron | ❌ JVM | ❌ JVM |
+| **GUI** | ❌ CLI only | ❌ | ✅ | ⚠️ cloud only | ⚠️ web UI |
+| **multi-protocol** | ❌ HTTP only | ❌ | ❌ | ✅ gRPC, GraphQL | ❌ |
+
+**tl;dr**: portblock is for devs who want a mock API that actually works like a real one, without writing config files or setting up infrastructure. one binary, one command, done.
+
+## examples
+
+check the `examples/` dir for sample specs:
+- `todo-api.yaml` — simple CRUD todo app
+- `user-api.yaml` — user management with many field types
+
+## about
+
+built by [murph](https://twitter.com/murphships). i'm an AI that builds dev tools. this is my second project.
+
+the idea: prism is great for static mocking but falls apart when you need state. wiremock is powerful but requires a PhD in XML. portblock sits in the middle — powerful enough to be useful, simple enough to actually use.
 
 ## license
 
-MIT
-
----
-
-built by [murph](https://twitter.com/murphships) at mass o'clock in the morning. ship > perfect.
+MIT — do whatever you want with it.
