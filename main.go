@@ -132,12 +132,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 // Store is the in-memory CRUD store
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]map[string]interface{} // resource type -> id -> object
+	mu      sync.RWMutex
+	data    map[string]map[string]interface{} // resource type -> id -> object
+	written map[string]bool                   // tracks if a resource has ever been written to
 }
 
 func NewStore() *Store {
-	return &Store{data: make(map[string]map[string]interface{})}
+	return &Store{
+		data:    make(map[string]map[string]interface{}),
+		written: make(map[string]bool),
+	}
+}
+
+func (s *Store) HasBeenWritten(resource string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.written[resource]
 }
 
 func (s *Store) Get(resource, id string) (interface{}, bool) {
@@ -169,6 +179,7 @@ func (s *Store) Put(resource, id string, obj interface{}) {
 		s.data[resource] = make(map[string]interface{})
 	}
 	s.data[resource][id] = obj
+	s.written[resource] = true
 }
 
 func (s *Store) Delete(resource, id string) bool {
@@ -391,23 +402,25 @@ func (s *MockServer) handleGetOne(w http.ResponseWriter, r *http.Request, op *op
 func (s *MockServer) handleGetList(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource string) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// if we have stored items, return them
+	// if any POST has been made to this resource, only return stored items (even if empty)
 	items := s.store.List(resource)
-	if len(items) > 0 {
+	if s.store.HasBeenWritten(resource) {
 		json.NewEncoder(w).Encode(items)
 		return
 	}
 
-	// generate fake list from schema
-	schema := s.getResponseSchema(op, "200")
-	if schema != nil {
-		rng := seededRng(s.seed, r.URL.Path)
-		fake := generateFromSchema(schema, rng, 0)
-		json.NewEncoder(w).Encode(fake)
-		return
+	// no writes yet — generate fake seed data
+	if len(items) == 0 {
+		schema := s.getResponseSchema(op, "200")
+		if schema != nil {
+			rng := seededRng(s.seed, r.URL.Path)
+			fake := generateFromSchema(schema, rng, 0)
+			json.NewEncoder(w).Encode(fake)
+			return
+		}
 	}
 
-	json.NewEncoder(w).Encode([]interface{}{})
+	json.NewEncoder(w).Encode(items)
 }
 
 func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id string) {
@@ -517,6 +530,11 @@ func generateFromSchema(ref *openapi3.SchemaRef, rng *rand.Rand, depth int) inte
 		return generateFromSchema(schema.AnyOf[0], rng, depth+1)
 	}
 
+	// use example if available
+	if schema.Example != nil {
+		return schema.Example
+	}
+
 	switch schema.Type.Slice()[0] {
 	case "object":
 		return generateObject(schema, rng, depth)
@@ -538,9 +556,33 @@ func generateFromSchema(ref *openapi3.SchemaRef, rng *rand.Rand, depth int) inte
 func generateObject(schema *openapi3.Schema, rng *rand.Rand, depth int) interface{} {
 	result := make(map[string]interface{})
 	for name, prop := range schema.Properties {
-		result[name] = generateFromSchema(prop, rng, depth+1)
+		result[name] = generateFromSchemaWithName(prop, rng, depth+1, name)
 	}
 	return result
+}
+
+func generateFromSchemaWithName(ref *openapi3.SchemaRef, rng *rand.Rand, depth int, propName string) interface{} {
+	if ref == nil {
+		return nil
+	}
+	schema := ref.Value
+	if schema == nil || depth > 5 {
+		return nil
+	}
+
+	// for strings, use property-name-aware generation
+	if len(schema.Type.Slice()) > 0 && schema.Type.Slice()[0] == "string" && schema.Format == "" && len(schema.Enum) == 0 {
+		if v, ok := generateStringByName(propName, rng); ok {
+			return v
+		}
+	}
+
+	// also check examples on the schema
+	if schema.Example != nil {
+		return schema.Example
+	}
+
+	return generateFromSchema(ref, rng, depth)
 }
 
 func generateArray(schema *openapi3.Schema, rng *rand.Rand, depth int) interface{} {
@@ -550,6 +592,96 @@ func generateArray(schema *openapi3.Schema, rng *rand.Rand, depth int) interface
 		items[i] = generateFromSchema(schema.Items, rng, depth+1)
 	}
 	return items
+}
+
+func generateStringByName(propName string, rng *rand.Rand) (string, bool) {
+	faker := gofakeit.New(uint64(rng.Int63()))
+	name := strings.ToLower(propName)
+
+	switch {
+	// names
+	case name == "name" || name == "full_name" || name == "fullname":
+		return faker.Name(), true
+	case name == "first_name" || name == "firstname" || name == "given_name":
+		return faker.FirstName(), true
+	case name == "last_name" || name == "lastname" || name == "surname" || name == "family_name":
+		return faker.LastName(), true
+	case name == "username" || name == "user_name" || name == "handle" || name == "login":
+		return faker.Username(), true
+
+	// contact
+	case name == "email" || name == "email_address" || strings.HasSuffix(name, "_email"):
+		return faker.Email(), true
+	case name == "phone" || name == "phone_number" || name == "mobile" || name == "tel":
+		return faker.Phone(), true
+
+	// location
+	case name == "address" || name == "street" || name == "street_address":
+		return faker.Street(), true
+	case name == "city":
+		return faker.City(), true
+	case name == "state" || name == "province" || name == "region":
+		return faker.State(), true
+	case name == "country":
+		return faker.Country(), true
+	case name == "zip" || name == "zip_code" || name == "postal_code" || name == "zipcode":
+		return faker.Zip(), true
+	case name == "latitude" || name == "lat":
+		return fmt.Sprintf("%.6f", faker.Latitude()), true
+	case name == "longitude" || name == "lng" || name == "lon":
+		return fmt.Sprintf("%.6f", faker.Longitude()), true
+
+	// text content
+	case name == "title" || name == "subject" || name == "headline":
+		return faker.Sentence(3 + rng.Intn(4)), true
+	case name == "description" || name == "summary" || name == "bio" || name == "about":
+		return faker.Sentence(8 + rng.Intn(8)), true
+	case name == "body" || name == "content" || name == "text" || name == "message":
+		return faker.Paragraph(1, 3, 5, " "), true
+	case name == "comment" || name == "note" || name == "notes":
+		return faker.Sentence(5 + rng.Intn(6)), true
+
+	// web
+	case name == "url" || name == "website" || name == "link" || name == "homepage":
+		return faker.URL(), true
+	case name == "image" || name == "avatar" || name == "photo" || name == "picture" || name == "image_url" || name == "avatar_url":
+		return fmt.Sprintf("https://picsum.photos/seed/%d/640/480", rng.Intn(10000)), true
+	case name == "domain" || name == "hostname":
+		return faker.DomainName(), true
+	case name == "ip" || name == "ip_address":
+		return faker.IPv4Address(), true
+
+	// identifiers
+	case name == "slug":
+		return strings.ToLower(strings.ReplaceAll(faker.BuzzWord()+" "+faker.BuzzWord(), " ", "-")), true
+	case name == "sku" || name == "code" || name == "product_code":
+		return faker.LetterN(3) + "-" + fmt.Sprintf("%04d", rng.Intn(10000)), true
+	case name == "color" || name == "colour":
+		return faker.Color(), true
+
+	// business
+	case name == "company" || name == "company_name" || name == "organization" || name == "org":
+		return faker.Company(), true
+	case name == "job" || name == "job_title" || name == "role" || name == "position":
+		return faker.JobTitle(), true
+	case name == "industry" || name == "sector":
+		return faker.JobDescriptor(), true
+
+	// misc
+	case name == "currency" || name == "currency_code":
+		return faker.CurrencyShort(), true
+	case name == "language" || name == "lang" || name == "locale":
+		return faker.Language(), true
+	case name == "status":
+		statuses := []string{"active", "inactive", "pending", "completed", "archived"}
+		return statuses[rng.Intn(len(statuses))], true
+	case name == "type" || name == "kind" || name == "category":
+		return faker.Word(), true
+	case name == "tag" || name == "label":
+		return faker.Word(), true
+	}
+
+	return "", false
 }
 
 func generateString(schema *openapi3.Schema, rng *rand.Rand) string {
@@ -581,22 +713,24 @@ func generateString(schema *openapi3.Schema, rng *rand.Rand) string {
 		return faker.Password(true, true, true, false, false, 12)
 	}
 
-	// guess from property name patterns (via schema title or just generate)
-	minLen := 3
-	maxLen := 20
-	if schema.MinLength != 0 {
-		minLen = int(schema.MinLength)
-	}
+	// generate a realistic string based on length constraints
+	maxLen := 100
 	if schema.MaxLength != nil {
 		maxLen = int(*schema.MaxLength)
 	}
 
-	// generate a sentence-like string
-	words := faker.Sentence(minLen/4 + 1)
-	if len(words) > maxLen {
-		words = words[:maxLen]
+	// generate a full sentence
+	s := faker.Sentence(5 + rng.Intn(8))
+	// trim trailing period for cleaner look
+	s = strings.TrimSuffix(s, ".")
+	if len(s) > maxLen {
+		// truncate at last word boundary
+		s = s[:maxLen]
+		if idx := strings.LastIndex(s, " "); idx > 0 {
+			s = s[:idx]
+		}
 	}
-	return words
+	return s
 }
 
 func generateInteger(schema *openapi3.Schema, rng *rand.Rand) int64 {
