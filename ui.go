@@ -235,6 +235,63 @@ func logChaos(method, path string, dur time.Duration) {
 	fmt.Printf("  %s %s %s %s %s\n", m, p, s, chaos, t)
 }
 
+// logReload logs a successful spec reload
+func logReload(specFile string) {
+	msg := lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render("↻ reloaded")
+	file := lipgloss.NewStyle().Foreground(colorMuted).Render(specFile)
+	fmt.Printf("\n  %s %s\n", msg, file)
+}
+
+// logReloadError logs a failed spec reload
+func logReloadError(err error) {
+	msg := lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("✗ reload failed")
+	detail := lipgloss.NewStyle().Foreground(colorDim).Render(err.Error())
+	fmt.Printf("\n  %s\n    %s\n", msg, detail)
+}
+
+// renderDiffBanner renders the banner for diff mode
+func renderDiffBanner(specFile, target string) string {
+	var b strings.Builder
+	title := styleTitle.Render("⬛ portblock diff") + " " + styleVersion.Render("v"+version)
+	b.WriteString(title + "\n")
+	b.WriteString(styleLabel.Render("spec") + styleValue.Render(specFile) + "\n")
+	b.WriteString(styleLabel.Render("target") + styleURL.Render(target) + "\n")
+	return styleBanner.Render(b.String())
+}
+
+// renderDiffResults renders the diff report
+func renderDiffResults(results []diffResult) string {
+	var b strings.Builder
+	sep := styleSeparator.Render(strings.Repeat("─", 60))
+	b.WriteString("\n  " + sep + "\n")
+
+	for _, r := range results {
+		m := methodStyle(r.method).Render(r.method)
+		p := stylePath.Render(r.path)
+		var icon string
+		switch r.status {
+		case "match":
+			icon = lipgloss.NewStyle().Foreground(colorGreen).Render("✅")
+		case "skip":
+			icon = lipgloss.NewStyle().Foreground(colorDim).Render("⏭️ ")
+		case "extra":
+			icon = lipgloss.NewStyle().Foreground(colorYellow).Render("⚠️ ")
+		case "mismatch":
+			icon = lipgloss.NewStyle().Foreground(colorRed).Render("❌")
+		case "error":
+			icon = lipgloss.NewStyle().Foreground(colorRed).Render("💥")
+		default:
+			icon = "  "
+		}
+		b.WriteString(fmt.Sprintf("  %s %s %s\n", icon, m, p))
+		for _, d := range r.details {
+			b.WriteString(fmt.Sprintf("      %s\n", lipgloss.NewStyle().Foreground(colorDim).Render(d)))
+		}
+	}
+	b.WriteString("  " + sep + "\n")
+	return b.String()
+}
+
 // logProxyValidation logs proxy validation warnings
 func logProxyValidation(kind, method, path string, err error) {
 	m := methodStyle(method).Render(method)

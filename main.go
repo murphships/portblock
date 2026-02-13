@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/brianvoe/gofakeit/v7"
+	"github.com/fsnotify/fsnotify"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
@@ -35,7 +36,7 @@ var (
 	delay   time.Duration
 	chaos   bool
 	noAuth  bool
-	version = "0.2.0"
+	version = "0.3.0"
 )
 
 func main() {
@@ -58,6 +59,9 @@ func main() {
 	serveCmd.Flags().BoolVar(&chaos, "chaos", false, "chaos mode — random 500s and latency spikes")
 	serveCmd.Flags().BoolVar(&noAuth, "no-auth", false, "skip auth simulation")
 
+	var watch bool
+	serveCmd.Flags().BoolVar(&watch, "watch", true, "watch spec file for changes and hot reload")
+
 	proxyCmd := &cobra.Command{
 		Use:   "proxy [spec-file]",
 		Short: "proxy to a real API and validate against the spec",
@@ -79,7 +83,19 @@ func main() {
 	}
 	replayCmd.Flags().IntVarP(&port, "port", "p", 4000, "port to listen on")
 
-	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd)
+	diffCmd := &cobra.Command{
+		Use:   "diff [spec-file]",
+		Short: "compare a live API against the spec",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runDiff,
+	}
+	var diffTarget string
+	var diffHeaders []string
+	diffCmd.Flags().StringVar(&diffTarget, "target", "", "target base URL to compare against (required)")
+	diffCmd.Flags().StringArrayVar(&diffHeaders, "header", nil, "headers to forward (e.g. 'Authorization: Bearer xxx')")
+	diffCmd.MarkFlagRequired("target")
+
+	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd, diffCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -88,6 +104,7 @@ func main() {
 
 func runServe(cmd *cobra.Command, args []string) error {
 	specFile := args[0]
+	watchFlag, _ := cmd.Flags().GetBool("watch")
 
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(specFile)
@@ -126,6 +143,79 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println(renderBanner("serve", specFile, port, seed, delay, chaos, noAuth))
 
 	// collect and render routes
+	printRoutes(doc)
+	fmt.Print(renderReady(port))
+
+	// hot reload watcher
+	if watchFlag {
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			stdlog.Printf("warning: could not start file watcher: %v", err)
+		} else {
+			if err := watcher.Add(specFile); err != nil {
+				stdlog.Printf("warning: could not watch %s: %v", specFile, err)
+			} else {
+				go func() {
+					var debounce <-chan time.Time
+					for {
+						select {
+						case event, ok := <-watcher.Events:
+							if !ok {
+								return
+							}
+							if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+								debounce = time.After(200 * time.Millisecond)
+							}
+						case <-debounce:
+							newLoader := openapi3.NewLoader()
+							newDoc, err := newLoader.LoadFromFile(specFile)
+							if err != nil {
+								logReloadError(err)
+								continue
+							}
+							if err := newDoc.Validate(context.Background()); err != nil {
+								logReloadError(err)
+								continue
+							}
+							newRouter, err := gorillamux.NewRouter(newDoc)
+							if err != nil {
+								logReloadError(err)
+								continue
+							}
+							server.mu.Lock()
+							server.doc = newDoc
+							server.router = newRouter
+							server.mu.Unlock()
+							logReload(specFile)
+							printRoutes(newDoc)
+						case err, ok := <-watcher.Errors:
+							if !ok {
+								return
+							}
+							stdlog.Printf("watcher error: %v", err)
+						}
+					}
+				}()
+				defer watcher.Close()
+			}
+		}
+	}
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		fmt.Print(renderShutdown())
+		srv.Shutdown(context.Background())
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func printRoutes(doc *openapi3.T) {
 	var routes []routeInfo
 	for path, pathItem := range doc.Paths.Map() {
 		methods := []string{}
@@ -147,20 +237,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		routes = append(routes, routeInfo{path: path, methods: methods})
 	}
 	fmt.Print(renderRoutes(routes))
-	fmt.Print(renderReady(port))
-
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		fmt.Print(renderShutdown())
-		srv.Shutdown(context.Background())
-	}()
-
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
 }
 
 // --------------- Store ---------------
@@ -233,6 +309,7 @@ func (s *Store) Delete(resource, id string) bool {
 // --------------- MockServer ---------------
 
 type MockServer struct {
+	mu     sync.RWMutex
 	doc    *openapi3.T
 	store  *Store
 	seed   int64
@@ -651,6 +728,8 @@ func applyQueryParams(items []interface{}, query url.Values) []interface{} {
 // --------------- Main Request Handler ---------------
 
 func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	start := time.Now()
 
 	// CORS
@@ -1375,4 +1454,235 @@ func generateNumber(schema *openapi3.Schema, rng *rand.Rand) float64 {
 		max = *schema.Max
 	}
 	return min + rng.Float64()*(max-min)
+}
+
+// --------------- Diff Command ---------------
+
+type diffResult struct {
+	method  string
+	path    string
+	status  string // "match", "extra", "missing", "mismatch", "error"
+	details []string
+}
+
+func runDiff(cmd *cobra.Command, args []string) error {
+	specFile := args[0]
+	target, _ := cmd.Flags().GetString("target")
+	headers, _ := cmd.Flags().GetStringArray("header")
+
+	loader := openapi3.NewLoader()
+	doc, err := loader.LoadFromFile(specFile)
+	if err != nil {
+		return fmt.Errorf("failed to load spec: %w", err)
+	}
+	if err := doc.Validate(context.Background()); err != nil {
+		stdlog.Printf("warning: spec validation issues: %v", err)
+	}
+
+	target = strings.TrimRight(target, "/")
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	fmt.Println(renderDiffBanner(specFile, target))
+
+	var results []diffResult
+	hasDiffs := false
+
+	for path, pathItem := range doc.Paths.Map() {
+		ops := map[string]*openapi3.Operation{
+			"GET": pathItem.Get, "POST": pathItem.Post, "PUT": pathItem.Put,
+			"PATCH": pathItem.Patch, "DELETE": pathItem.Delete,
+		}
+		for method, op := range ops {
+			if op == nil {
+				continue
+			}
+
+			// skip paths with parameters for now (can't guess IDs)
+			if strings.Contains(path, "{") {
+				results = append(results, diffResult{
+					method: method, path: path, status: "skip",
+					details: []string{"skipped — path has parameters"},
+				})
+				continue
+			}
+
+			reqURL := target + path
+			req, err := http.NewRequest(method, reqURL, nil)
+			if err != nil {
+				results = append(results, diffResult{method: method, path: path, status: "error", details: []string{err.Error()}})
+				hasDiffs = true
+				continue
+			}
+			req.Header.Set("Accept", "application/json")
+			for _, h := range headers {
+				parts := strings.SplitN(h, ":", 2)
+				if len(parts) == 2 {
+					req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+				}
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				results = append(results, diffResult{method: method, path: path, status: "error", details: []string{err.Error()}})
+				hasDiffs = true
+				continue
+			}
+
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			dr := diffResult{method: method, path: path}
+
+			// check status code
+			expectedCode := expectedStatusCode(op, method)
+			if resp.StatusCode != expectedCode {
+				dr.status = "mismatch"
+				dr.details = append(dr.details, fmt.Sprintf("expected status %d, got %d", expectedCode, resp.StatusCode))
+				hasDiffs = true
+			}
+
+			// compare response body shape
+			schema := getResponseSchemaForDiff(op, resp.StatusCode)
+			if schema != nil && len(bodyBytes) > 0 {
+				var actual interface{}
+				if err := json.Unmarshal(bodyBytes, &actual); err == nil {
+					diffs := compareShape(schema, actual, "")
+					if len(diffs) > 0 {
+						dr.details = append(dr.details, diffs...)
+						if dr.status == "" {
+							dr.status = "mismatch"
+						}
+						hasDiffs = true
+					}
+				}
+			}
+
+			if dr.status == "" {
+				dr.status = "match"
+			}
+			results = append(results, dr)
+		}
+	}
+
+	fmt.Print(renderDiffResults(results))
+
+	if hasDiffs {
+		os.Exit(1)
+	}
+	return nil
+}
+
+func expectedStatusCode(op *openapi3.Operation, method string) int {
+	if op.Responses == nil {
+		return 200
+	}
+	// check for explicit 200/201/204
+	for _, code := range []string{"200", "201", "204"} {
+		if op.Responses.Value(code) != nil {
+			c, _ := strconv.Atoi(code)
+			return c
+		}
+	}
+	return 200
+}
+
+func getResponseSchemaForDiff(op *openapi3.Operation, statusCode int) *openapi3.SchemaRef {
+	if op.Responses == nil {
+		return nil
+	}
+	codeStr := strconv.Itoa(statusCode)
+	resp := op.Responses.Value(codeStr)
+	if resp == nil {
+		return nil
+	}
+	if resp.Value == nil {
+		return nil
+	}
+	ct := resp.Value.Content.Get("application/json")
+	if ct == nil {
+		return nil
+	}
+	return ct.Schema
+}
+
+func compareShape(schemaRef *openapi3.SchemaRef, actual interface{}, prefix string) []string {
+	if schemaRef == nil || schemaRef.Value == nil {
+		return nil
+	}
+	schema := schemaRef.Value
+	var diffs []string
+
+	types := schema.Type.Slice()
+	if len(types) == 0 && len(schema.Properties) > 0 {
+		types = []string{"object"}
+	}
+	if len(types) == 0 {
+		return nil
+	}
+
+	switch types[0] {
+	case "object":
+		m, ok := actual.(map[string]interface{})
+		if !ok {
+			return []string{fmt.Sprintf("❌ %s: expected object, got %T", fieldPath(prefix, ""), actual)}
+		}
+		// check for missing fields
+		for name, prop := range schema.Properties {
+			fp := fieldPath(prefix, name)
+			val, exists := m[name]
+			if !exists {
+				diffs = append(diffs, fmt.Sprintf("❌ %s: missing field", fp))
+				continue
+			}
+			diffs = append(diffs, compareShape(prop, val, fp)...)
+		}
+		// check for extra fields
+		for name := range m {
+			if _, exists := schema.Properties[name]; !exists {
+				diffs = append(diffs, fmt.Sprintf("⚠️  %s: extra field", fieldPath(prefix, name)))
+			}
+		}
+	case "array":
+		arr, ok := actual.([]interface{})
+		if !ok {
+			return []string{fmt.Sprintf("❌ %s: expected array, got %T", fieldPath(prefix, ""), actual)}
+		}
+		if len(arr) > 0 && schema.Items != nil {
+			diffs = append(diffs, compareShape(schema.Items, arr[0], prefix+"[0]")...)
+		}
+	case "string":
+		if _, ok := actual.(string); !ok {
+			diffs = append(diffs, fmt.Sprintf("❌ %s: expected string, got %T", fieldPath(prefix, ""), actual))
+		}
+	case "integer":
+		switch actual.(type) {
+		case float64:
+			// JSON numbers are float64, ok for integer
+		default:
+			diffs = append(diffs, fmt.Sprintf("❌ %s: expected integer, got %T", fieldPath(prefix, ""), actual))
+		}
+	case "number":
+		if _, ok := actual.(float64); !ok {
+			diffs = append(diffs, fmt.Sprintf("❌ %s: expected number, got %T", fieldPath(prefix, ""), actual))
+		}
+	case "boolean":
+		if _, ok := actual.(bool); !ok {
+			diffs = append(diffs, fmt.Sprintf("❌ %s: expected boolean, got %T", fieldPath(prefix, ""), actual))
+		}
+	}
+
+	return diffs
+}
+
+func fieldPath(prefix, name string) string {
+	if prefix == "" {
+		if name == "" {
+			return "(root)"
+		}
+		return name
+	}
+	if name == "" {
+		return prefix
+	}
+	return prefix + "." + name
 }

@@ -2,6 +2,19 @@
 
 all notable changes to portblock. format loosely based on [keep a changelog](https://keepachangelog.com/).
 
+## [0.3.0] — 2026-02-13
+
+the "it watches you back" release. portblock now reloads when you edit your spec and can diff against live APIs.
+
+### added
+- **hot reload** — spec file changes are picked up automatically while serving. edit your spec, portblock reloads the router instantly. store data stays intact. disable with `--watch=false`
+- **diff command** — `portblock diff spec.yaml --target https://api.example.com` compares a live API against your spec. checks status codes, response shapes, missing/extra fields, type mismatches. exit code 1 if differences found (CI-friendly). supports `--header` for auth forwarding
+- **PROJECT.md** — proper project documentation for future sessions
+
+### changed
+- MockServer now uses a read-write mutex for thread-safe hot reload
+- extracted route printing into a reusable function
+
 ## [0.2.0] — 2026-02-12
 
 the "ok now it's actually useful" release. portblock went from "cool demo" to "you could actually use this at work" territory.
@@ -34,5 +47,6 @@ the "it works on my machine" release. first public version of portblock.
 - **delay simulation** — `--delay 200ms` to simulate network latency
 - **custom port** — `--port 8080` because 4000 isn't always available
 
+[0.3.0]: https://github.com/murphships/portblock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/murphships/portblock/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/murphships/portblock/releases/tag/v0.1.0
