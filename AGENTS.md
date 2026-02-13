@@ -3,7 +3,7 @@
 ## what it is
 CLI tool that mocks APIs from OpenAPI specs. give it a spec file, get a working mock server with fake data, stateful CRUD, auth simulation, and more.
 
-**current version:** 0.4.0
+**current version:** 0.5.0
 
 ## architecture
 multi-file Go project:
@@ -31,6 +31,7 @@ multi-file Go project:
 | `diff` | ✅ implemented | compare live API against spec |
 | `init` | ✅ implemented | scaffold a `.portblock.yaml` config file |
 | `generate` | ✅ implemented | reverse-engineer OpenAPI spec from live API |
+| `test` | ✅ implemented | contract test runner (YAML tests, variable interpolation, CI-ready) |
 
 ## features
 | feature | status |
@@ -53,6 +54,9 @@ multi-file Go project:
 | strict mode (--strict) | ✅ |
 | webhooks/callbacks | ✅ |
 | spec generation (reverse-engineer) | ✅ |
+| contract testing (portblock test) | ✅ |
+| GitHub Action | ✅ |
+| docs site (VitePress + GitHub Pages) | ✅ |
 | Dockerfile + docker-compose | ✅ |
 
 ## dependencies
@@ -75,6 +79,7 @@ go build -o portblock .
 ├── strict.go            # strict mode validation
 ├── webhooks.go          # webhook/callback dispatching
 ├── generate.go          # spec generation from live APIs
+├── test.go              # contract test runner
 ├── go.mod / go.sum      # dependencies
 ├── Dockerfile           # multi-stage docker build
 ├── docker-compose.yml   # docker compose example

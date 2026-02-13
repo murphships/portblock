@@ -1,0 +1,67 @@
+tests:
+  - name: "create a todo"
+    method: POST
+    path: /todos
+    headers:
+      Content-Type: application/json
+    body:
+      title: "ship portblock v0.5"
+      description: "make it launch-ready"
+      completed: false
+    expect:
+      status: 201
+      body:
+        - field: "id"
+          exists: true
+        - field: "title"
+          equals: "ship portblock v0.5"
+        - field: "completed"
+          equals: false
+          type: boolean
+    save:
+      todo_id: "id"
+
+  - name: "get created todo"
+    method: GET
+    path: "/todos/{{todo_id}}"
+    expect:
+      status: 200
+      body:
+        - field: "title"
+          equals: "ship portblock v0.5"
+        - field: "id"
+          exists: true
+
+  - name: "list todos returns array"
+    method: GET
+    path: /todos
+    expect:
+      status: 200
+      is_array: true
+      min_length: 1
+
+  - name: "update todo"
+    method: PUT
+    path: "/todos/{{todo_id}}"
+    headers:
+      Content-Type: application/json
+    body:
+      title: "ship portblock v0.5"
+      completed: true
+    expect:
+      status: 200
+      body:
+        - field: "completed"
+          equals: true
+
+  - name: "delete todo"
+    method: DELETE
+    path: "/todos/{{todo_id}}"
+    expect:
+      status: 204
+
+  - name: "deleted todo returns 404"
+    method: GET
+    path: "/todos/{{todo_id}}"
+    expect:
+      status: 404

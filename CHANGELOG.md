@@ -2,6 +2,19 @@
 
 all notable changes to portblock. format loosely based on [keep a changelog](https://keepachangelog.com/).
 
+## [0.5.0] — 2026-02-13
+
+the "launch release". portblock can now test API contracts, run in CI, and has a docs site. this is the one you tell people about.
+
+### added
+- **`portblock test`** — contract test runner. write tests in YAML, run them against the built-in mock or a live API. variable interpolation from saved responses (`{{user_id}}`), JSON path for nested fields, regex matching, type assertions, array assertions. beautiful TUI output with ✅/❌. exit code 0/1 for CI. `--verbose` for full request/response dumps. if no `--target`, spins up an internal mock server automatically
+- **GitHub Action** — `.github/actions/portblock/action.yml` for running tests in CI. install + run in one step. supports `test` and `diff` commands
+- **docs site** — VitePress documentation deployed to GitHub Pages. covers all features, CI/CD integration, Docker usage
+- **example tests** — `examples/todo-tests.yaml` demonstrating the test runner against the todo API
+
+### changed
+- version bump to 0.5.0
+
 ## [0.4.0] — 2026-02-13
 
 the "kitchen sink release". threw everything at the wall and it all stuck. config files, docker, strict mode, webhooks, and a whole reverse-engineering command. portblock is getting dangerously close to being a real tool.
@@ -63,6 +76,7 @@ the "it works on my machine" release. first public version of portblock.
 - **delay simulation** — `--delay 200ms` to simulate network latency
 - **custom port** — `--port 8080` because 4000 isn't always available
 
+[0.5.0]: https://github.com/murphships/portblock/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/murphships/portblock/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/murphships/portblock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/murphships/portblock/compare/v0.1.0...v0.2.0

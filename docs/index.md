@@ -1,9 +1,10 @@
 ---
 layout: home
+
 hero:
   name: portblock
   text: mock APIs that actually behave like real ones
-  tagline: one OpenAPI spec. one command. a fully working API with realistic data, stateful CRUD, and request validation. no config files needed.
+  tagline: One binary. One command. Stateful CRUD, smart fake data, contract testing, and more.
   actions:
     - theme: brand
       text: Get Started
@@ -15,46 +16,44 @@ hero:
 features:
   - icon: 🧠
     title: Smart Fake Data
-    details: reads your schema types AND property names to generate realistic data. knows "email" means email, "city" means city. 60+ patterns built in.
+    details: Reads property names AND schema types. Knows "email" = email, "city" = city. 60+ field patterns. No examples needed in your spec.
   - icon: 💾
     title: Stateful CRUD
-    details: POST creates. GET returns what you created. DELETE removes it. your mock actually behaves like a real API.
+    details: POST creates. GET returns what you created. DELETE removes it. Your mock behaves like a real API, not a static stub.
   - icon: ✅
-    title: Request Validation
-    details: validates incoming requests against your spec. bad request? helpful 400 with details. no surprises in production.
-  - icon: 🎭
-    title: Chaos Mode
-    details: test your app's resilience with random 500s and latency spikes. one flag, instant chaos.
-  - icon: 🔐
-    title: Auth Simulation
-    details: security schemes from your spec are enforced automatically. no token? 401. skip it all with --no-auth.
+    title: Contract Testing
+    details: Write tests in YAML, run them against your mock or a live API. Variable interpolation, regex matching, CI-ready exit codes.
   - icon: 🔄
-    title: Proxy + Record + Replay
-    details: forward to a real API, validate against your spec, record responses, and replay them offline.
+    title: Hot Reload
+    details: Edit your spec, save it, and the mock updates instantly. No restart needed. Your stored data survives reloads.
+  - icon: 🔌
+    title: Proxy & Diff
+    details: Forward to a real API and validate both sides. Diff a live API against your spec. Record responses and replay them offline.
+  - icon: ⚡
+    title: Single Binary
+    details: Written in Go. No Node.js, no JVM, no runtime. Download, run, done. Available via Homebrew, apt, scoop, Docker.
 ---
 
-## quick demo
+## Quick Start
 
 ```bash
 # install
-go install github.com/murphships/portblock@latest
+brew install murphships/tap/portblock
 
-# run it
+# mock an API
 portblock serve api.yaml
 
-# that's it. working API at localhost:4000
-curl localhost:4000/users | jq '.[0]'
+# test contracts
+portblock test api.yaml tests.yaml
+
+# test against a live API
+portblock test api.yaml tests.yaml --target https://api.staging.com
 ```
 
-```json
-{
-  "id": "6e759b9a-874f-4a43-aaee-c810d8151d86",
-  "name": "Johnathon Braun",
-  "email": "kaleyboyer@garcia.net",
-  "company": "Development Seed",
-  "city": "Boston",
-  "status": "active"
-}
-```
+## Why portblock?
 
-no examples in your spec. no config files. just realistic data, instantly.
+**prism** returns static responses. **wiremock** needs XML config files. **mockoon** needs a GUI.
+
+portblock gives you a **working API** from an OpenAPI spec — with state, smart data, and contract testing — in **one command**.
+
+[Get started →](/getting-started)

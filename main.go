@@ -36,7 +36,7 @@ var (
 	delay   time.Duration
 	chaos   bool
 	noAuth  bool
-	version = "0.4.0"
+	version = "0.5.0"
 )
 
 func main() {
@@ -117,7 +117,17 @@ func main() {
 	generateCmd.Flags().StringVar(&genOutput, "output", "", "output file (default: stdout)")
 	generateCmd.MarkFlagRequired("target")
 
-	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd, diffCmd, initCmd, generateCmd)
+	testCmd := &cobra.Command{
+		Use:   "test [spec-file] [test-file]",
+		Short: "run contract tests against a mock or live API",
+		Args:  cobra.ExactArgs(2),
+		RunE:  runTest,
+	}
+	var testTarget string
+	testCmd.Flags().StringVar(&testTarget, "target", "", "target base URL to test against (default: spin up internal mock)")
+	testCmd.Flags().BoolVar(&testVerbose, "verbose", false, "show full request/response dumps")
+
+	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd, diffCmd, initCmd, generateCmd, testCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -931,6 +941,12 @@ func (s *MockServer) handleGetOne(w http.ResponseWriter, r *http.Request, op *op
 	obj, ok := s.store.Get(resource, id)
 	if ok {
 		writeResponse(w, contentType, 200, obj)
+		return
+	}
+
+	// if the resource has been written to (POST/PUT/DELETE happened), return 404 for missing items
+	if s.store.HasBeenWritten(resource) {
+		writeResponse(w, contentType, 404, map[string]string{"error": "not found"})
 		return
 	}
 

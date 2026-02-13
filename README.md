@@ -274,6 +274,69 @@ portblock generate --target https://api.example.com --paths /users,/posts,/comme
 
 infers types, formats (email, UUID, date-time, URI), and required fields from response data.
 
+### contract testing
+
+write tests in YAML, run them against your mock or a live API:
+
+```bash
+# test against the built-in mock
+portblock test api.yaml tests.yaml
+
+# test against a live API
+portblock test api.yaml tests.yaml --target https://api.staging.com
+
+# verbose output
+portblock test api.yaml tests.yaml --verbose
+```
+
+test file format:
+
+```yaml
+tests:
+  - name: "create user"
+    method: POST
+    path: /users
+    body:
+      name: "test user"
+      email: "test@example.com"
+    expect:
+      status: 201
+      body:
+        - field: "id"
+          exists: true
+        - field: "name"
+          equals: "test user"
+    save:
+      user_id: "id"
+
+  - name: "get created user"
+    method: GET
+    path: "/users/{{user_id}}"
+    expect:
+      status: 200
+```
+
+features: variable interpolation (`{{var}}`), JSON path for nested fields (`data.user.id`), regex matching, type checks, array assertions, sequential execution with saved state. exit code 0 = all pass, 1 = failures. perfect for CI.
+
+### github action
+
+```yaml
+- uses: murphships/portblock/.github/actions/portblock@main
+  with:
+    spec: api.yaml
+    tests: tests.yaml
+```
+
+test against a live API:
+
+```yaml
+- uses: murphships/portblock/.github/actions/portblock@main
+  with:
+    spec: api.yaml
+    tests: tests.yaml
+    target: https://api.staging.com
+```
+
 ### more flags
 
 ```bash
@@ -308,6 +371,7 @@ portblock serve api.yaml \
 | **docker** | ✅ multi-stage | ✅ | ✅ | ✅ | ✅ |
 | **single binary** | ✅ Go | ❌ Node.js | ❌ Electron | ❌ JVM | ❌ JVM |
 | **GUI** | ❌ CLI only | ❌ | ✅ | ⚠️ cloud only | ⚠️ web UI |
+| **contract testing** | ✅ YAML tests, CI-ready | ❌ | ❌ | ⚠️ separate tool | ⚠️ separate tool |
 | **multi-protocol** | ❌ HTTP only | ❌ | ❌ | ✅ gRPC, GraphQL | ❌ |
 
 **tl;dr**: portblock is for devs who want a mock API that actually works like a real one, without writing config files or setting up infrastructure. one binary, one command, done.
@@ -317,6 +381,10 @@ portblock serve api.yaml \
 check the `examples/` dir for sample specs:
 - `todo-api.yaml` — simple CRUD todo app
 - `user-api.yaml` — user management with many field types
+
+## docs
+
+full documentation at [murphships.github.io/portblock](https://murphships.github.io/portblock/)
 
 ## about
 

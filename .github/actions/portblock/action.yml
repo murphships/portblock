@@ -1,0 +1,43 @@
+name: 'portblock'
+description: 'Mock and test APIs with portblock'
+inputs:
+  spec:
+    description: 'Path to OpenAPI spec file'
+    required: true
+  tests:
+    description: 'Path to test file (optional)'
+    required: false
+  command:
+    description: 'Command to run (serve|test|diff)'
+    default: 'test'
+  target:
+    description: 'Target URL for diff/test'
+    required: false
+  version:
+    description: 'portblock version'
+    default: 'latest'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install portblock
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          curl -sL https://github.com/murphships/portblock/releases/latest/download/portblock_linux_amd64.tar.gz | tar xz
+        else
+          curl -sL "https://github.com/murphships/portblock/releases/download/v${VERSION}/portblock_linux_amd64.tar.gz" | tar xz
+        fi
+        sudo mv portblock /usr/local/bin/
+    - name: Run portblock
+      shell: bash
+      run: |
+        if [ "${{ inputs.command }}" = "test" ] && [ -n "${{ inputs.tests }}" ]; then
+          ARGS="${{ inputs.spec }} ${{ inputs.tests }}"
+          if [ -n "${{ inputs.target }}" ]; then
+            ARGS="$ARGS --target ${{ inputs.target }}"
+          fi
+          portblock test $ARGS
+        elif [ "${{ inputs.command }}" = "diff" ] && [ -n "${{ inputs.target }}" ]; then
+          portblock diff ${{ inputs.spec }} --target ${{ inputs.target }}
+        fi

@@ -1,0 +1,34 @@
+name: API Contract Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  contract-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # test against the mock server (no --target needed)
+      - name: Run contract tests
+        uses: ./.github/actions/portblock
+        with:
+          spec: examples/todo-api.yaml
+          tests: examples/todo-tests.yaml
+          command: test
+
+  # example: test against a staging API
+  # staging-test:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Test staging API
+  #       uses: ./.github/actions/portblock
+  #       with:
+  #         spec: api.yaml
+  #         tests: tests.yaml
+  #         command: test
+  #         target: https://staging-api.example.com
