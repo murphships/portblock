@@ -36,7 +36,7 @@ var (
 	delay   time.Duration
 	chaos   bool
 	noAuth  bool
-	version = "0.3.0"
+	version = "0.4.0"
 )
 
 func main() {
@@ -58,6 +58,9 @@ func main() {
 	serveCmd.Flags().DurationVar(&delay, "delay", 0, "simulated latency per request (e.g. 200ms)")
 	serveCmd.Flags().BoolVar(&chaos, "chaos", false, "chaos mode — random 500s and latency spikes")
 	serveCmd.Flags().BoolVar(&noAuth, "no-auth", false, "skip auth simulation")
+	serveCmd.Flags().BoolVar(&strictMode, "strict", false, "strict mode — reject invalid specs, validate responses")
+	serveCmd.Flags().StringVar(&webhookTarget, "webhook-target", "", "URL to send webhooks to on mutations")
+	serveCmd.Flags().DurationVar(&webhookDelay, "webhook-delay", 0, "delay before sending webhooks (e.g. 500ms)")
 
 	var watch bool
 	serveCmd.Flags().BoolVar(&watch, "watch", true, "watch spec file for changes and hot reload")
@@ -73,6 +76,7 @@ func main() {
 	proxyCmd.Flags().IntVarP(&port, "port", "p", 4000, "port to listen on")
 	proxyCmd.Flags().StringVar(&proxyTarget, "target", "", "target base URL to proxy to (required)")
 	proxyCmd.Flags().StringVar(&proxyRecord, "record", "", "file to record responses to")
+	proxyCmd.Flags().BoolVar(&strictMode, "strict", false, "strict mode — reject invalid specs, validate responses")
 	proxyCmd.MarkFlagRequired("target")
 
 	replayCmd := &cobra.Command{
@@ -95,7 +99,25 @@ func main() {
 	diffCmd.Flags().StringArrayVar(&diffHeaders, "header", nil, "headers to forward (e.g. 'Authorization: Bearer xxx')")
 	diffCmd.MarkFlagRequired("target")
 
-	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd, diffCmd)
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "scaffold a .portblock.yaml config file",
+		Args:  cobra.NoArgs,
+		RunE:  runInit,
+	}
+
+	generateCmd := &cobra.Command{
+		Use:   "generate",
+		Short: "probe a running API and generate an OpenAPI spec",
+		RunE:  runGenerate,
+	}
+	var genTarget, genPaths, genOutput string
+	generateCmd.Flags().StringVar(&genTarget, "target", "", "base URL of the API to probe (required)")
+	generateCmd.Flags().StringVar(&genPaths, "paths", "", "comma-separated paths to probe (e.g. /users,/posts)")
+	generateCmd.Flags().StringVar(&genOutput, "output", "", "output file (default: stdout)")
+	generateCmd.MarkFlagRequired("target")
+
+	rootCmd.AddCommand(serveCmd, proxyCmd, replayCmd, diffCmd, initCmd, generateCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -104,6 +126,12 @@ func main() {
 
 func runServe(cmd *cobra.Command, args []string) error {
 	specFile := args[0]
+
+	// load config file, CLI flags override
+	cfg := loadConfig()
+	applyConfig(cfg)
+	applyConfigWatch(cfg, cmd)
+
 	watchFlag, _ := cmd.Flags().GetBool("watch")
 
 	loader := openapi3.NewLoader()
@@ -112,8 +140,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load spec: %w", err)
 	}
 
-	if err := doc.Validate(context.Background()); err != nil {
-		stdlog.Printf("warning: spec validation issues: %v", err)
+	if err := strictValidateSpec(doc); err != nil {
+		return err
 	}
 
 	if seed == 0 {
@@ -125,12 +153,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		stdlog.Printf("warning: could not build validation router: %v", err)
 	}
 
+	webhookMgr := NewWebhookManager(webhookTarget, webhookDelay, doc)
+
 	server := &MockServer{
-		doc:    doc,
-		store:  NewStore(),
-		seed:   seed,
-		router: router,
-		noAuth: noAuth,
+		doc:        doc,
+		store:      NewStore(),
+		seed:       seed,
+		router:     router,
+		noAuth:     noAuth,
+		webhookMgr: webhookMgr,
 	}
 
 	mux := http.NewServeMux()
@@ -309,12 +340,13 @@ func (s *Store) Delete(resource, id string) bool {
 // --------------- MockServer ---------------
 
 type MockServer struct {
-	mu     sync.RWMutex
-	doc    *openapi3.T
-	store  *Store
-	seed   int64
-	router routers.Router
-	noAuth bool
+	mu         sync.RWMutex
+	doc        *openapi3.T
+	store      *Store
+	seed       int64
+	router     routers.Router
+	noAuth     bool
+	webhookMgr *WebhookManager
 }
 
 var pathParamRe = regexp.MustCompile(`\{([^}]+)\}`)
@@ -798,6 +830,30 @@ func (s *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 			logRequestValidationError(r.Method, r.URL.Path, time.Since(start))
 			return
 		}
+		// strict mode: additional required field checking
+		if strictMode && op.RequestBody != nil && op.RequestBody.Value != nil {
+			ct := op.RequestBody.Value.Content.Get("application/json")
+			if ct != nil && ct.Schema != nil {
+				var bodyMap map[string]interface{}
+				if json.Unmarshal(bodyBytes, &bodyMap) == nil {
+					errs := strictValidateRequestBody(ct.Schema, bodyMap)
+					if len(errs) > 0 {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(400)
+						details := make([]map[string]string, len(errs))
+						for i, e := range errs {
+							details[i] = map[string]string{"message": e}
+						}
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"error":   "strict validation failed",
+							"details": details,
+						})
+						logRequestValidationError(r.Method, r.URL.Path, time.Since(start))
+						return
+					}
+				}
+			}
+		}
 	}
 
 	// restore body for handlers
@@ -866,6 +922,9 @@ func (s *MockServer) handlePost(w http.ResponseWriter, r *http.Request, op *open
 	s.store.Put(resource, id, body)
 
 	writeResponse(w, contentType, 201, body)
+
+	// fire webhook
+	s.webhookMgr.FireWebhook("POST", resource, 201, body)
 }
 
 func (s *MockServer) handleGetOne(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, resource, id, contentType string) {
@@ -942,11 +1001,17 @@ func (s *MockServer) handlePut(w http.ResponseWriter, r *http.Request, op *opena
 
 	s.store.Put(resource, id, body)
 	writeResponse(w, contentType, 200, body)
+
+	// fire webhook
+	s.webhookMgr.FireWebhook("PUT", resource, 200, body)
 }
 
 func (s *MockServer) handleDelete(w http.ResponseWriter, r *http.Request, resource, id string) {
 	s.store.Delete(resource, id)
 	w.WriteHeader(204)
+
+	// fire webhook
+	s.webhookMgr.FireWebhook("DELETE", resource, 204, map[string]string{"id": id})
 }
 
 func (s *MockServer) handleGeneric(w http.ResponseWriter, r *http.Request, op *openapi3.Operation, contentType string) {
@@ -954,10 +1019,18 @@ func (s *MockServer) handleGeneric(w http.ResponseWriter, r *http.Request, op *o
 	if schema != nil {
 		rng := seededRng(s.seed, r.URL.Path)
 		fake := generateFromSchema(schema, rng, 0)
+		s.strictValidateResponse(schema, fake, r.URL.Path)
 		writeResponse(w, contentType, 200, fake)
 		return
 	}
 	writeResponse(w, contentType, 200, map[string]string{"status": "ok"})
+}
+
+func (s *MockServer) strictValidateResponse(schema *openapi3.SchemaRef, data interface{}, path string) {
+	warnings := validateResponseAgainstSchema(schema, data, path)
+	for _, w := range warnings {
+		logStrictWarning("response", w)
+	}
 }
 
 func (s *MockServer) getResponseSchema(op *openapi3.Operation, statusCode string) *openapi3.SchemaRef {
@@ -985,13 +1058,16 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	target, _ := cmd.Flags().GetString("target")
 	recordFile, _ := cmd.Flags().GetString("record")
 
+	cfg := loadConfig()
+	applyConfig(cfg)
+
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(specFile)
 	if err != nil {
 		return fmt.Errorf("failed to load spec: %w", err)
 	}
-	if err := doc.Validate(context.Background()); err != nil {
-		stdlog.Printf("warning: spec validation issues: %v", err)
+	if err := strictValidateSpec(doc); err != nil {
+		return err
 	}
 
 	router, err := gorillamux.NewRouter(doc)

@@ -292,6 +292,52 @@ func renderDiffResults(results []diffResult) string {
 	return b.String()
 }
 
+// logWebhookDelivery logs webhook delivery attempts
+func logWebhookDelivery(event, target string, status int, err error) {
+	hook := lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render("⤴ webhook")
+	e := lipgloss.NewStyle().Foreground(colorWhite).Render(event)
+	t := lipgloss.NewStyle().Foreground(colorDim).Render(target)
+
+	if err != nil {
+		errMsg := lipgloss.NewStyle().Foreground(colorRed).Render(err.Error())
+		fmt.Printf("  %s %s → %s %s\n", hook, e, t, errMsg)
+	} else {
+		s := statusStyle(status)
+		fmt.Printf("  %s %s → %s %s\n", hook, e, t, s)
+	}
+}
+
+// logStrictWarning logs a strict mode warning
+func logStrictWarning(context, msg string) {
+	warn := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⚠ strict")
+	ctx := lipgloss.NewStyle().Foreground(colorMuted).Render("[" + context + "]")
+	detail := lipgloss.NewStyle().Foreground(colorDim).Render(msg)
+	fmt.Printf("  %s %s %s\n", warn, ctx, detail)
+}
+
+// renderGenerateBanner renders the banner for generate mode
+func renderGenerateBanner(target string, pathCount int) string {
+	var b strings.Builder
+	title := styleTitle.Render("⬛ portblock generate") + " " + styleVersion.Render("v"+version)
+	b.WriteString(title + "\n")
+	b.WriteString(styleLabel.Render("target") + styleURL.Render(target) + "\n")
+	b.WriteString(styleLabel.Render("paths") + styleValue.Render(fmt.Sprintf("%d to probe", pathCount)) + "\n")
+	return styleBanner.Render(b.String())
+}
+
+// logGenerateProbe logs a probe attempt during generate
+func logGenerateProbe(path string, status int, result string) {
+	p := stylePath.Render(path)
+	if status > 0 {
+		s := statusStyle(status)
+		r := lipgloss.NewStyle().Foreground(colorDim).Render(result)
+		fmt.Printf("  GET    %s %s %s\n", p, s, r)
+	} else {
+		r := lipgloss.NewStyle().Foreground(colorRed).Render(result)
+		fmt.Printf("  GET    %s %s\n", p, r)
+	}
+}
+
 // logProxyValidation logs proxy validation warnings
 func logProxyValidation(kind, method, path string, err error) {
 	m := methodStyle(method).Render(method)

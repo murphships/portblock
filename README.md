@@ -56,6 +56,20 @@ tar xzf portblock.tar.gz
 sudo mv portblock /usr/local/bin/
 ```
 
+### docker
+
+```bash
+docker build -t portblock .
+docker run -v $(pwd)/api.yaml:/spec.yaml -p 4000:4000 portblock serve /spec.yaml --port 4000
+```
+
+or with docker compose:
+
+```bash
+# put your spec in examples/, then:
+docker compose up
+```
+
 ### build from source
 
 ```bash
@@ -200,6 +214,66 @@ portblock serve api.yaml --chaos
 # → random latency spikes up to 2s
 ```
 
+### config file
+
+tired of typing flags? create a `.portblock.yaml`:
+
+```bash
+portblock init
+```
+
+```yaml
+port: 8080
+seed: 42
+delay: 200ms
+chaos: false
+no-auth: false
+watch: true
+strict: false
+```
+
+looks in CWD first, then home dir. CLI flags always override.
+
+### strict mode
+
+validate everything:
+
+```bash
+portblock serve api.yaml --strict
+# → rejects specs with validation warnings
+# → validates generated responses against schema constraints
+# → enforces required fields aggressively on requests
+```
+
+catches minLength, maxLength, pattern, minimum, maximum, enum violations in generated data.
+
+### webhooks/callbacks
+
+simulate webhooks when mutations happen:
+
+```bash
+portblock serve api.yaml --webhook-target http://localhost:9000/hooks --webhook-delay 500ms
+```
+
+- fires on POST/PUT/PATCH/DELETE
+- 3 retries with exponential backoff
+- logged in the TUI
+- picks up callback definitions from your spec
+
+### generate (reverse-engineer a spec)
+
+probe a running API and generate an OpenAPI spec:
+
+```bash
+# auto-probe common paths
+portblock generate --target https://jsonplaceholder.typicode.com
+
+# specify paths
+portblock generate --target https://api.example.com --paths /users,/posts,/comments --output spec.yaml
+```
+
+infers types, formats (email, UUID, date-time, URI), and required fields from response data.
+
 ### more flags
 
 ```bash
@@ -208,7 +282,9 @@ portblock serve api.yaml \
   --seed 42 \            # reproducible fake data
   --delay 200ms \        # simulate network latency
   --chaos \              # random failures
-  --no-auth              # skip auth checks
+  --no-auth \            # skip auth checks
+  --strict \             # strict validation mode
+  --webhook-target <url> # fire webhooks on mutations
 ```
 
 ## how it compares
@@ -225,6 +301,11 @@ portblock serve api.yaml \
 | **record/replay** | ✅ | ❌ | ❌ | ✅ | ✅ |
 | **chaos/fault injection** | ✅ built-in flag | ⚠️ limited | ⚠️ manual | ✅ | ✅ |
 | **query filtering** | ✅ | ❌ | ❌ | ⚠️ matching rules | ⚠️ matching rules |
+| **strict validation** | ✅ built-in flag | ⚠️ partial | ❌ | ✅ | ✅ |
+| **webhooks/callbacks** | ✅ auto from spec | ❌ | ❌ | ⚠️ manual | ⚠️ manual |
+| **spec generation** | ✅ reverse-engineer | ❌ | ❌ | ❌ | ❌ |
+| **config file** | ✅ yaml/json | ❌ | ✅ | ✅ | ✅ |
+| **docker** | ✅ multi-stage | ✅ | ✅ | ✅ | ✅ |
 | **single binary** | ✅ Go | ❌ Node.js | ❌ Electron | ❌ JVM | ❌ JVM |
 | **GUI** | ❌ CLI only | ❌ | ✅ | ⚠️ cloud only | ⚠️ web UI |
 | **multi-protocol** | ❌ HTTP only | ❌ | ❌ | ✅ gRPC, GraphQL | ❌ |

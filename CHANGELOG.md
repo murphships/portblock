@@ -2,6 +2,22 @@
 
 all notable changes to portblock. format loosely based on [keep a changelog](https://keepachangelog.com/).
 
+## [0.4.0] — 2026-02-13
+
+the "kitchen sink release". threw everything at the wall and it all stuck. config files, docker, strict mode, webhooks, and a whole reverse-engineering command. portblock is getting dangerously close to being a real tool.
+
+### added
+- **config file** — `.portblock.yaml` or `.portblock.json` in CWD or home dir. no more typing `--port 8080 --seed 42` every time. `portblock init` scaffolds one for you
+- **strict mode** — `--strict` flag on serve/proxy. rejects specs with validation warnings, validates generated responses against schema constraints (minLength, maxLength, pattern, minimum, maximum, enum). catches the lies your mock tells
+- **webhooks/callbacks** — `--webhook-target <url>` fires webhooks on POST/PUT/PATCH/DELETE. configurable delay with `--webhook-delay`, 3 retries with exponential backoff, logged in the TUI. if your spec has callbacks, portblock knows about them
+- **`portblock generate`** — reverse-engineer an OpenAPI spec from a running API. probes endpoints, infers types and formats (emails, UUIDs, dates, URLs), figures out required fields. `--target`, `--paths`, `--output`. actually useful for undocumented APIs
+- **Dockerfile** — multi-stage build, alpine final image. includes docker-compose.yml example
+- **`portblock init`** — scaffolds a `.portblock.yaml` config file in your project
+
+### changed
+- version bump to 0.4.0
+- config file values are loaded before CLI flags (flags always win)
+
 ## [0.3.0] — 2026-02-13
 
 the "it watches you back" release. portblock now reloads when you edit your spec and can diff against live APIs.
@@ -47,6 +63,7 @@ the "it works on my machine" release. first public version of portblock.
 - **delay simulation** — `--delay 200ms` to simulate network latency
 - **custom port** — `--port 8080` because 4000 isn't always available
 
+[0.4.0]: https://github.com/murphships/portblock/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/murphships/portblock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/murphships/portblock/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/murphships/portblock/releases/tag/v0.1.0

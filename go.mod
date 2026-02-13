@@ -5,8 +5,10 @@ go 1.25.3
 require (
 	github.com/brianvoe/gofakeit/v7 v7.14.0
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/spf13/cobra v1.10.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -15,7 +17,6 @@ require (
 	github.com/charmbracelet/x/ansi v0.8.0 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
-	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
@@ -37,5 +38,4 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
 	golang.org/x/sys v0.30.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
